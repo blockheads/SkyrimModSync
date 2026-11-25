@@ -54,8 +54,9 @@ sms host publish modlist.json --output pack.json
 Share `pack.json`. A gist is the lightest way:
 
 ```sh
-gh gist create modlist.json pack.json           # once; friends run `sms play gist:<id>`
-gh gist edit <id> -f pack.json pack.json        # after publishing again
+gh gist create modlist.json pack.json      # once (secret by default); friends run `sms play gist:<id>`
+# after publishing again:
+jq -n --rawfile c pack.json '{files: {"pack.json": {content: $c}}}' | gh api -X PATCH gists/<id> --input -
 ```
 
 Or attach it to a GitHub release (`github:OWNER/REPO`), or share the code `publish` prints and keep
