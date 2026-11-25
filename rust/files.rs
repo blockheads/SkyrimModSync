@@ -147,6 +147,19 @@ pub fn locate(root: &Path, rel: &str) -> Result<Option<PathBuf>> {
         Ok(None)
     }
 }
+/// A folder under `root` by name, matched without case.
+pub fn locate_dir(root: &Path, name: &str) -> Result<Option<PathBuf>> {
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    Ok(fs::read_dir(root)?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            fold(&e.file_name().to_string_lossy()) == fold(name)
+                && e.file_type().is_ok_and(|t| t.is_dir())
+        })
+        .map(|e| e.path()))
+}
 pub fn require(root: &Path, rel: &str) -> Result<PathBuf> {
     locate(root, rel)?.ok_or_else(|| Error::new("missing_file", format!("Missing file: {rel}")))
 }
@@ -329,7 +342,7 @@ pub fn separate(a: &Path, b: &Path) -> Result<()> {
     if a.starts_with(b) || b.starts_with(a) {
         Err(Error::new(
             "overlapping_paths",
-            "Base, managed storage and download cache must be separate folders.",
+            "The game, store and MO2 folders must not be inside one another.",
         ))
     } else {
         Ok(())

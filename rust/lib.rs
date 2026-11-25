@@ -1,17 +1,26 @@
-pub mod acquisition;
-pub mod authoring;
+//! Share a Skyrim mod setup with friends. The host's MO2 profile is published as a pack (files, load
+//! order, shared INI settings); friends sync it into a store, load it into their game, play, unload.
+pub mod archive;
+pub mod channel;
 pub mod config;
-pub mod engine;
+pub mod deploy;
 pub mod files;
-pub mod json;
-pub mod package;
+#[cfg(test)]
+mod flow_tests;
+pub mod github;
+pub mod hashes;
+pub mod host;
+pub mod ini;
+pub mod launch;
+pub mod mo2;
+pub mod net;
+pub mod nexus;
+pub mod pack;
 pub mod peer;
-pub mod play;
-pub mod recipe;
-pub mod repair;
-pub mod revision;
 pub mod snapshot;
-pub mod target;
+pub mod steam;
+pub mod store;
+pub mod sync;
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +64,7 @@ impl From<serde_json::Error> for Error {
 }
 impl From<zip::result::ZipError> for Error {
     fn from(e: zip::result::ZipError) -> Self {
-        Self::new("invalid_package", e.to_string())
+        Self::new("invalid_archive", e.to_string())
     }
 }
 impl From<reqwest::Error> for Error {

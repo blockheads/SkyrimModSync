@@ -1,0 +1,46 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: sms-linux-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: sms-windows-x86_64.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: sms-macos-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: sms-macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/sms"
+          [[ "${{ matrix.target }}" == *windows* ]] && src="$src.exe"
+          cp "$src" "${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && chmod +x sms-linux-* sms-macos-* && sha256sum * > SHA256SUMS
+      - run: >
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+          --title "SkyrimModSync $GITHUB_REF_NAME"
+          --notes "Download the sms binary for your system (Windows: sms-windows-x86_64.exe). SHA256SUMS lists their hashes. See the README for host and friend steps."
+        env:
+          GH_TOKEN: ${{ github.token }}
