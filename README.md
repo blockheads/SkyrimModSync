@@ -4,12 +4,12 @@ Share a Skyrim mod setup with friends. The host keeps editing mods in Mod Organi
 publishes the profile; a friend pastes the code, and `sms play` syncs the mods, loads them into
 their game, and starts Skyrim through Steam. `sms unload` puts their game back exactly as it was.
 
-A CLI (`--json` for scripts and a future GUI). Windows and Linux (Steam/Proton); macOS builds exist, playing
-there (CrossOver) is untested.
+A CLI (`--json` for scripts and a future GUI). Windows and Linux (Steam/Proton); macOS is not supported
+yet.
 
 **Get it:** the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest) has `sms` for
-Windows (`sms-windows-x86_64.exe`), Linux and macOS. Put it anywhere and run it from a terminal (rename it `sms` if
-you like); on Linux and macOS `chmod +x` it first.
+Windows (`sms-windows-x86_64.exe`) and Linux (`sms-linux-x86_64`). Put it anywhere and run it from a terminal (rename it `sms` if
+you like); on Linux `chmod +x` it first.
 
 ```
 host                                     friend
@@ -79,8 +79,8 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --check
 ```
 
-Releases: push a `v*` tag; `.github/workflows/release.yml` builds `sms` for Linux, Windows and macOS (Apple
-Silicon and Intel) and publishes them with `SHA256SUMS`.
+Releases: push a `v*` tag; `.github/workflows/release.yml` builds `sms` for Linux and Windows and
+publishes them with `SHA256SUMS`.
 
 Rust 1.91 (`rust-toolchain.toml`). The tests run a whole flow on fake games: an MO2 profile
 published, a friend synced through a fake Nexus and a local P2P host, loaded, unloaded back to
