@@ -293,7 +293,8 @@ fn write_user(
         // Whole or absent: a crash mid-copy must not leave a torn backup to restore.
         let part = b.with_extension("part");
         fs::copy(&file, &part)?;
-        File::open(&part)?.sync_all()?;
+        // Writable: Windows refuses to flush a read-only handle.
+        OpenOptions::new().write(true).open(&part)?.sync_all()?;
         fs::rename(&part, &b)?;
     }
     let mut out = File::create(&file)?;
