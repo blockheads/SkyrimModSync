@@ -246,6 +246,7 @@ async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Res
         out.write_all(&buf[..n]).await?;
     }
     out.sync_all().await?;
+    drop(out); // Windows will not rename a file still open
     if hasher.count() != size || hasher.finalize().to_hex().as_str() != hash {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(Error::new(
