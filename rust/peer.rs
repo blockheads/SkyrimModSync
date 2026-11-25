@@ -1,359 +1,258 @@
-//! The host's P2P service (iroh): its signed pack and the files only the host has. Read-only over
-//! the wire; only objects a published pack names are served.
-use crate::{
-    channel::{self, Channel, Head, PrivateChannel},
-    files,
-    pack::Pack,
-    store::Store,
-    Error, Result,
-};
+//! The host's P2P service over iroh (which authenticates the host's key, crosses home routers and relays
+//! when it must). One stream per request: `pack` → the pack JSON; `file <hash> <offset>` → `1` and the
+//! file's bytes from where they are on the host's disk, or `0`. Only files the published pack names.
+use crate::{files, pack::Pack, store::Store, Error, Result};
 use iroh::{
     endpoint::{presets, Connection, RelayMode},
     protocol::{AcceptError, ProtocolHandler, Router},
-    Endpoint, EndpointAddr,
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
 };
-use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::{
-    fs,
-    future::IntoFuture,
-    io::Write,
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-const ALPN: &[u8] = b"skyrim-mod-sync/channel/4";
+const ALPN: &[u8] = b"sms/5";
+const STREAMS: usize = 8;
 
+/// What the host serves: its pack and where each of its files is on its disk.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    pack: String,
-    revision: Option<String>,
-}
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reply {
-    head: Head,
-    pack: Pack,
+pub struct Published {
+    pub pack: Pack,
+    pub local: BTreeMap<String, PathBuf>,
 }
 
-fn failure(_: impl std::fmt::Display) -> Error {
+fn failure(e: impl std::fmt::Display) -> Error {
     Error::new(
         "peer_unavailable",
-        "Couldn't reach the host. The host must keep `sms host serve` running; check the connection and retry (finished files are kept).",
+        format!("Couldn't reach the host ({e}). The host must run `sms host serve`."),
     )
 }
 fn runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()
-        .map_err(Into::into)
+        .build()?)
 }
 
-#[derive(Debug, Clone)]
-struct Control {
-    root: PathBuf,
-    channel: Channel,
-    store: FsStore,
-}
-impl Control {
-    async fn reply(&self, request: Request) -> Result<Reply> {
-        if request.pack != self.channel.pack {
-            return Err(Error::new(
-                "channel_mismatch",
-                "This host does not publish that pack.",
-            ));
-        }
-        let path = match request.revision {
-            Some(id) if files::digest_valid(&id) => {
-                self.root.join("published").join(format!("{id}.json"))
-            }
-            Some(_) => return Err(Error::new("invalid_pack", "Invalid requested revision.")),
-            None => self.root.join("channel-head.json"),
-        };
-        let head: Head = files::read_json(&path)?;
-        head.validate()?;
-        if head.channel.pack != self.channel.pack
-            || head.channel.publisher != self.channel.publisher
-        {
-            return Err(Error::new(
-                "channel_mismatch",
-                "Publisher identity changed.",
-            ));
-        }
-        let pack: Pack = files::read_json(
-            &self
-                .root
-                .join("packs")
-                .join(format!("{}.json", head.revision)),
-        )?;
-        if pack.id()? != head.revision {
-            return Err(Error::new(
-                "invalid_pack",
-                "The published pack differs from its head.",
-            ));
-        }
-        for hash in pack.host_objects() {
-            let parsed = hash.parse::<iroh_blobs::Hash>().map_err(failure)?;
-            if self.store.blobs().has(parsed).await.map_err(failure)? {
-                continue;
-            }
-            let path = channel::object_path(&self.root, &hash)?;
-            if channel::blob_hash(&path)? != hash {
-                return Err(Error::new(
-                    "object_corrupt",
-                    "A published host file changed on disk; publish again.",
-                ));
-            }
-            let tag = self.store.blobs().add_path(path).await.map_err(failure)?;
-            if tag.hash.to_string() != hash {
-                return Err(Error::new("object_corrupt", "Stored host file differs."));
-            }
-            self.store
-                .tags()
-                .set(hash.as_bytes(), tag.hash)
-                .await
-                .map_err(failure)?;
-        }
-        Ok(Reply { head, pack })
+/// The host's iroh key, made on first use.
+pub fn secret(path: &Path) -> Result<SecretKey> {
+    if let Ok(bytes) = std::fs::read(path) {
+        let key: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| Error::new("invalid_key", "The host key file is damaged."))?;
+        return Ok(SecretKey::from_bytes(&key));
     }
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|e| Error::new("io_error", e.to_string()))?;
+    files::write_atomic(path, &key)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(SecretKey::from_bytes(&key))
 }
-impl ProtocolHandler for Control {
-    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        let (mut send, mut recv) = connection.accept_bi().await?;
-        let raw = recv
-            .read_to_end(16384)
-            .await
-            .map_err(AcceptError::from_err)?;
-        let request: Request = serde_json::from_slice(&raw).map_err(AcceptError::from_err)?;
-        let reply = self.reply(request).await.map_err(AcceptError::from_err)?;
-        let bytes = serde_json::to_vec(&reply).map_err(AcceptError::from_err)?;
-        send.write_all(&bytes)
-            .await
-            .map_err(AcceptError::from_err)?;
-        send.finish()?;
-        connection.closed().await;
+
+#[derive(Clone, Debug)]
+struct Handler(Arc<(Vec<u8>, BTreeMap<String, PathBuf>)>);
+
+impl Handler {
+    async fn answer(
+        &self,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let request = recv.read_to_end(256).await.map_err(failure)?;
+        let request = String::from_utf8_lossy(&request);
+        let mut words = request.split_whitespace();
+        match (
+            words.next(),
+            words.next(),
+            words.next().and_then(|o| o.parse::<u64>().ok()),
+        ) {
+            (Some("pack"), None, None) => send.write_all(&self.0 .0).await.map_err(failure)?,
+            (Some("file"), Some(hash), Some(offset)) => match self.0 .1.get(hash) {
+                Some(path) => {
+                    let mut file = tokio::fs::File::open(path).await?;
+                    file.seek(std::io::SeekFrom::Start(offset)).await?;
+                    send.write_all(b"1").await.map_err(failure)?;
+                    tokio::io::copy(&mut file, &mut send).await?;
+                }
+                None => send.write_all(b"0").await.map_err(failure)?,
+            },
+            _ => return Err(Error::new("bad_request", "Unknown request.")),
+        }
+        send.finish().map_err(failure)?;
         Ok(())
     }
 }
 
-/// Serves the host's latest pack until cancelled (Ctrl-C).
-pub fn serve(root: &Path, no_relay: bool, bind: Option<SocketAddr>) -> Result<Value> {
-    serve_until(
-        root,
-        no_relay,
-        bind,
-        |ready| {
-            println!("{ready}");
-            let _ = std::io::stdout().flush();
-        },
-        || crate::check_cancel().is_err(),
-    )
+impl ProtocolHandler for Handler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        while let Ok((send, recv)) = connection.accept_bi().await {
+            let me = self.clone();
+            tokio::spawn(async move { me.answer(send, recv).await });
+        }
+        Ok(())
+    }
 }
 
-/// Serves until `stop` says so; `ready` gets the code and addresses once listening.
-pub fn serve_until(
-    root: &Path,
-    no_relay: bool,
+/// Serves `published` until `stop` says so; `ready` gets the code (the endpoint id) once listening.
+pub fn serve(
+    key: SecretKey,
+    published: Published,
     bind: Option<SocketAddr>,
-    ready: impl FnOnce(&Value),
+    ready: impl FnOnce(&str),
     stop: impl Fn() -> bool,
-) -> Result<Value> {
-    let _lock = files::Lock::take(&root.join("locks/serve.lock"))?;
-    let private = PrivateChannel::load_or_create(&root.join("channel-private.json"))?;
-    let channel = private.channel()?;
-    let head: Head = files::read_json(&root.join("channel-head.json"))
-        .map_err(|_| Error::new("not_published", "Publish a pack first: `sms host publish`."))?;
-    head.validate()?;
+) -> Result<()> {
+    let pack = serde_json::to_vec(&published.pack)?;
     runtime()?.block_on(async {
-        let mut builder = Endpoint::builder(presets::N0).secret_key(iroh::SecretKey::from_bytes(&channel::decode32(&private.endpoint_key)?));
-        if no_relay {
-            builder = builder.relay_mode(RelayMode::Disabled);
-        } else if let Some(r) = &private.relay {
-            builder = builder.relay_mode(RelayMode::custom([r.parse::<iroh::RelayUrl>().map_err(failure)?]));
-        }
+        let mut builder = Endpoint::builder(presets::N0).secret_key(key);
         if let Some(addr) = bind {
-            builder = builder.bind_addr(addr).map_err(failure)?;
+            builder = builder
+                .relay_mode(RelayMode::Disabled)
+                .bind_addr(addr)
+                .map_err(failure)?;
         }
         let endpoint = builder.bind().await.map_err(failure)?;
-        let store = FsStore::load(root.join("peer/server")).await.map_err(failure)?;
-        let control = Control { root: root.into(), channel: channel.clone(), store: store.clone() };
-        control.reply(Request { pack: channel.pack.clone(), revision: None }).await?;
+        let id = endpoint.id().to_string();
         let router = Router::builder(endpoint)
-            .accept(ALPN, control)
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&store, None))
+            .accept(ALPN, Handler(Arc::new((pack, published.local))))
             .spawn();
-        let code = channel.code()?;
-        ready(&json!({"state": "serving", "code": code, "addresses": router.endpoint().addr(), "sequence": head.sequence}));
+        ready(&id);
         while !stop() {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         router.shutdown().await.map_err(failure)?;
-        Ok(json!({"state": "stopped", "code": code}))
+        Ok(())
     })
 }
 
-fn address(channel: &Channel, direct: Option<SocketAddr>) -> Result<EndpointAddr> {
-    let mut addr = EndpointAddr::new(
-        channel
-            .endpoint
-            .parse::<iroh::EndpointId>()
-            .map_err(failure)?,
-    );
-    if let Some(r) = &channel.relay {
-        addr = addr.with_relay_url(r.parse().map_err(failure)?);
-    }
+async fn connect(code: &str, direct: Option<SocketAddr>) -> Result<(Endpoint, Connection)> {
+    let id: EndpointId = code
+        .trim()
+        .parse()
+        .map_err(|_| Error::new("invalid_code", "That is not an sms code."))?;
+    let mut builder = Endpoint::builder(presets::N0);
+    let mut addr = EndpointAddr::new(id);
     if let Some(a) = direct {
+        builder = builder.relay_mode(RelayMode::Disabled);
         addr = addr.with_ip_addr(a);
     }
-    Ok(addr)
-}
-async fn endpoint(direct: Option<SocketAddr>) -> Result<Endpoint> {
-    let mut builder = Endpoint::builder(presets::N0);
-    if direct.is_some() {
-        builder = builder.relay_mode(RelayMode::Disabled);
-    }
-    builder.bind().await.map_err(failure)
-}
-async fn wait<T, E: std::fmt::Display>(
-    future: impl std::future::Future<Output = std::result::Result<T, E>>,
-    phase: &str,
-) -> Result<T> {
-    tokio::pin!(future);
-    let mut heartbeat = Instant::now();
-    loop {
-        tokio::select! {
-            r = &mut future => return r.map_err(failure),
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                crate::check_cancel()?;
-                if heartbeat.elapsed() > Duration::from_secs(20) {
-                    crate::event(phase, json!({"status": "waiting_or_transferring"}));
-                    heartbeat = Instant::now();
-                }
-            }
-        }
-    }
+    let endpoint = builder.bind().await.map_err(failure)?;
+    let conn = tokio::time::timeout(Duration::from_secs(30), endpoint.connect(addr, ALPN))
+        .await
+        .map_err(failure)?
+        .map_err(failure)?;
+    Ok((endpoint, conn))
 }
 
-/// Asks the host for its latest (or a pinned) pack.
-pub fn fetch_pack(
-    channel: &Channel,
-    store: &Store,
-    pin: Option<&str>,
-    direct: Option<SocketAddr>,
-) -> Result<(Pack, Head)> {
-    channel.validate()?;
+async fn ask(conn: &Connection, request: &str) -> Result<iroh::endpoint::RecvStream> {
+    let (mut send, recv) = conn.open_bi().await.map_err(failure)?;
+    send.write_all(request.as_bytes()).await.map_err(failure)?;
+    send.finish().map_err(failure)?;
+    Ok(recv)
+}
+
+/// The host's pack.
+pub fn fetch_pack(code: &str, direct: Option<SocketAddr>) -> Result<Pack> {
     runtime()?.block_on(async {
-        let ep = endpoint(direct).await?;
-        let result = async {
-            let conn = wait(
-                tokio::time::timeout(
-                    Duration::from_secs(30),
-                    ep.connect(address(channel, direct)?, ALPN),
-                ),
-                "peer_connecting",
-            )
+        let (endpoint, conn) = connect(code, direct).await?;
+        let bytes = ask(&conn, "pack")
             .await?
-            .map_err(failure)?;
-            let (mut send, mut recv) = conn.open_bi().await.map_err(failure)?;
-            send.write_all(&serde_json::to_vec(&Request {
-                pack: channel.pack.clone(),
-                revision: pin.map(str::to_owned),
-            })?)
+            .read_to_end(256 << 20)
             .await
             .map_err(failure)?;
-            send.finish().map_err(failure)?;
-            let raw = wait(
-                tokio::time::timeout(
-                    Duration::from_secs(120),
-                    recv.read_to_end(files::MAX_JSON as usize),
-                ),
-                "peer_pack",
-            )
-            .await?
-            .map_err(failure)?;
-            conn.close(0u32.into(), b"received");
-            let reply: Reply = serde_json::from_slice(&raw)?;
-            reply.head.validate()?;
-            if reply.head.channel.publisher != channel.publisher
-                || reply.head.channel.endpoint != channel.endpoint
-                || reply.head.channel.pack != channel.pack
-                || reply.head.revision != reply.pack.id()?
-                || pin.is_some_and(|p| p != reply.head.revision)
-            {
-                return Err(Error::new(
-                    "channel_mismatch",
-                    "The host's answer does not match the code.",
-                ));
-            }
-            if pin.is_none() {
-                store.accept(&reply.head)?;
-            }
-            Ok((reply.pack, reply.head))
-        }
-        .await;
-        ep.close().await;
-        result
+        conn.close(0u32.into(), b"done");
+        endpoint.close().await;
+        let pack: Pack = serde_json::from_slice(&bytes)?;
+        pack.validate()?;
+        Ok(pack)
     })
 }
 
-/// Fetches host files (blob, sha256, size) into the store.
-pub fn fetch_objects(
-    channel: &Channel,
-    store: &Store,
-    wanted: &[(String, String, u64)],
+/// Fetches files (hash, size) from the host into the store, several at once; a cut file resumes.
+pub fn fetch_files(
+    code: &str,
     direct: Option<SocketAddr>,
+    store: &Store,
+    wanted: &[(String, u64)],
 ) -> Result<()> {
     if wanted.is_empty() {
         return Ok(());
     }
     runtime()?.block_on(async {
-        let ep = endpoint(direct).await?;
-        let blobs = FsStore::load(store.root.join("peer"))
-            .await
-            .map_err(failure)?;
-        let result = async {
-            let staging = store.root.join("staging");
-            fs::create_dir_all(&staging)?;
-            for (blob, sha256, size) in wanted {
-                if store.has(sha256, *size) {
-                    continue;
-                }
-                let hash = blob.parse::<iroh_blobs::Hash>().map_err(failure)?;
-                crate::event("host_file", json!({"sha256": sha256, "size": size}));
-                let conn = wait(
-                    tokio::time::timeout(
-                        Duration::from_secs(30),
-                        ep.connect(address(channel, direct)?, iroh_blobs::ALPN),
-                    ),
-                    "peer_connecting",
-                )
-                .await?
-                .map_err(failure)?;
-                wait(
-                    blobs.remote().fetch(conn, hash).into_future(),
-                    "peer_downloading",
-                )
-                .await?;
-                let tmp = tempfile::NamedTempFile::new_in(&staging)?;
-                wait(
-                    blobs.blobs().export(hash, tmp.path()).into_future(),
-                    "peer_exporting",
-                )
-                .await?;
-                store.put(&mut fs::File::open(tmp.path())?, sha256, *size)?;
-            }
-            Ok::<(), Error>(())
+        let (endpoint, conn) = connect(code, direct).await?;
+        let gate = Arc::new(tokio::sync::Semaphore::new(STREAMS));
+        let mut jobs = tokio::task::JoinSet::new();
+        for (hash, size) in wanted.iter().cloned() {
+            let (conn, gate) = (conn.clone(), gate.clone());
+            let dest = store.object(&hash);
+            jobs.spawn(async move {
+                let _turn = gate.acquire().await;
+                fetch_one(&conn, &hash, size, &dest).await
+            });
         }
-        .await;
-        blobs.shutdown().await.map_err(failure)?;
-        ep.close().await;
-        result?;
-        // Every file is in the store now; the transfer cache only served resuming.
-        let _ = fs::remove_dir_all(store.root.join("peer"));
-        Ok(())
+        let mut result = Ok(());
+        while let Some(done) = jobs.join_next().await {
+            if let Err(e) = done.map_err(failure).and_then(|r| r) {
+                result = Err(e);
+            }
+        }
+        conn.close(0u32.into(), b"done");
+        endpoint.close().await;
+        result
     })
+}
+
+async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Result<()> {
+    crate::check_cancel()?;
+    tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
+    let part = dest.with_extension("part");
+    let mut hasher = blake3::Hasher::new();
+    let have = match tokio::fs::read(&part).await {
+        Ok(bytes) if (bytes.len() as u64) < size => {
+            hasher.update(&bytes);
+            bytes.len() as u64
+        }
+        _ => 0,
+    };
+    let mut recv = ask(conn, &format!("file {hash} {have}")).await?;
+    let mut flag = [0u8];
+    recv.read_exact(&mut flag).await.map_err(failure)?;
+    if flag[0] != b'1' {
+        return Err(Error::new(
+            "host_missing_file",
+            format!("The host no longer has {hash}: ask them to publish again."),
+        ));
+    }
+    let mut out = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part)
+        .await?;
+    if have == 0 {
+        out.set_len(0).await?;
+    }
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = recv.read(&mut buf).await.map_err(failure)?.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n]).await?;
+    }
+    out.sync_all().await?;
+    if hasher.count() != size || hasher.finalize().to_hex().as_str() != hash {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(Error::new(
+            "object_mismatch",
+            format!("{hash} arrived damaged; run sync again."),
+        ));
+    }
+    tokio::fs::rename(&part, dest).await?;
+    Ok(())
 }

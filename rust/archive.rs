@@ -2,21 +2,14 @@
 //! RAR is not supported: a mod installed from a RAR archive is sent by the host instead.
 use crate::{files, Error, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Member {
     /// '/'-separated, as stored.
     pub name: String,
     pub size: u64,
-    pub sha256: String,
+    pub hash: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,7 +48,6 @@ fn sevenz_error(e: sevenz_rust2::Error) -> Error {
 
 /// Calls `each` with every file member and a reader over its bytes, in archive order.
 fn walk(path: &Path, mut each: impl FnMut(&str, u64, &mut dyn Read) -> Result<()>) -> Result<()> {
-    files::regular(path)?;
     match kind(path)? {
         Kind::Zip => {
             let mut z = zip::ZipArchive::new(File::open(path)?)?;
@@ -92,16 +84,16 @@ fn walk(path: &Path, mut each: impl FnMut(&str, u64, &mut dyn Read) -> Result<()
     }
 }
 
-/// Every file in the archive with its size and SHA-256 (reads the whole archive).
+/// Every file in the archive with its size and BLAKE3 (reads the whole archive).
 pub fn members(path: &Path) -> Result<Vec<Member>> {
     let mut out = vec![];
     walk(path, |name, _, r| {
-        let mut h = Sha256::new();
-        let size = std::io::copy(r, &mut HashWriter(&mut h))?;
+        let mut h = blake3::Hasher::new();
+        std::io::copy(r, &mut h)?;
         out.push(Member {
             name: name.into(),
-            size,
-            sha256: format!("{:x}", h.finalize()),
+            size: h.count(),
+            hash: h.finalize().to_hex().to_string(),
         });
         Ok(())
     })?;
@@ -135,17 +127,6 @@ pub fn extract(
     Ok(())
 }
 
-struct HashWriter<'a>(&'a mut Sha256);
-impl Write for HashWriter<'_> {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.update(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,7 +144,7 @@ mod tests {
         for (n, b) in [("A.esp", &b"plugin"[..]), ("textures\\t.dds", b"texture")] {
             z.start_file(n, zip::write::SimpleFileOptions::default())
                 .unwrap();
-            z.write_all(b).unwrap();
+            std::io::Write::write_all(&mut z, b).unwrap();
         }
         z.finish().unwrap();
         for a in [&seven, &zip_path] {
@@ -172,7 +153,7 @@ mod tests {
                 .iter()
                 .find(|m| m.name.ends_with("textures/t.dds"))
                 .unwrap();
-            assert_eq!(t.sha256, files::hash_bytes(b"texture"));
+            assert_eq!(t.hash, blake3::hash(b"texture").to_hex().to_string());
             let mut got = vec![];
             extract(a, &[t.name.to_uppercase()].into(), |_, r| {
                 r.read_to_end(&mut got)?;

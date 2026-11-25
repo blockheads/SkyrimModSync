@@ -36,10 +36,9 @@ pub fn shared(path: &Path, file: &str) -> Result<Sections> {
     if !path.exists() {
         return Ok(Sections::new());
     }
-    let mut s = parse(&String::from_utf8_lossy(&files::bounded(
-        path,
-        4 * 1024 * 1024,
-    )?));
+    let mut s = parse(&String::from_utf8_lossy(
+        &std::fs::read(path).map_err(crate::Error::from)?,
+    ));
     s.retain(|section, _| !section.is_empty() && !personal(file, section));
     Ok(s)
 }

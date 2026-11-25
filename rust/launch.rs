@@ -1,7 +1,7 @@
 //! Starting the game through Steam: with a pack loaded, Steam's launcher slot holds SKSE's loader, so
 //! Steam (and on Linux its Proton setup) starts Skyrim with SKSE.
-use crate::{snapshot, steam, Error, Result};
-use std::{path::Path, process::Command};
+use crate::{steam, Error, Result};
+use std::process::Command;
 
 /// Whether a Skyrim process is running (load/unload must not touch a running game).
 pub fn game_running() -> bool {
@@ -42,18 +42,6 @@ pub fn refuse_if_running() -> Result<()> {
         return Err(Error::new(
             "game_running",
             "Skyrim is running: quit it first.",
-        ));
-    }
-    Ok(())
-}
-
-/// The friend's Skyrim must be the version the pack was made with.
-pub fn check_version(game: &Path, runtime: &str) -> Result<()> {
-    let have = snapshot::runtime(game)?;
-    if have != runtime {
-        return Err(Error::new(
-            "wrong_game_version",
-            format!("Your Skyrim is {have}; this pack needs {runtime}."),
         ));
     }
     Ok(())

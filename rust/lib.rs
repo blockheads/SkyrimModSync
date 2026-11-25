@@ -1,31 +1,30 @@
-//! Share a Skyrim mod setup with friends. The host's MO2 profile is published as a pack (files, load
-//! order, shared INI settings); friends sync it into a store, load it into their game, play, unload.
+//! Share a Skyrim mod setup with friends. The host's MO2 profile is published as a pack (files by hash,
+//! load order, shared INI settings); friends sync it, load it into their game, play, and unload it.
 pub mod archive;
-pub mod channel;
 pub mod config;
 pub mod deploy;
 pub mod files;
-#[cfg(test)]
-mod flow_tests;
-pub mod github;
-pub mod hashes;
+pub mod hash;
 pub mod host;
 pub mod ini;
 pub mod launch;
 pub mod mo2;
 pub mod net;
-pub mod nexus;
 pub mod pack;
 pub mod peer;
-pub mod snapshot;
+pub mod rules;
 pub mod steam;
 pub mod store;
 pub mod sync;
+#[cfg(test)]
+mod tests;
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// An error as data: a stable code and one sentence for people.
 #[derive(Debug, Serialize)]
 pub struct Error {
     pub code: String,
@@ -68,21 +67,25 @@ impl From<zip::result::ZipError> for Error {
     }
 }
 impl From<reqwest::Error> for Error {
-    fn from(_: reqwest::Error) -> Self {
-        Self::new("network_error", "HTTPS request failed; check connectivity and retry. Credentials and signed URLs are omitted from errors.")
+    fn from(e: reqwest::Error) -> Self {
+        Self::new(
+            "network_error",
+            format!("A download failed ({}).", e.without_url()),
+        )
     }
 }
+
 pub static CANCELLED: AtomicBool = AtomicBool::new(false);
 pub fn check_cancel() -> Result<()> {
     if CANCELLED.load(Ordering::Relaxed) {
-        Err(Error::new(
+        return Err(Error::new(
             "cancelled",
-            "Cancelled; cached downloads and the previous installation are retained.",
-        ))
-    } else {
-        Ok(())
+            "Cancelled; finished downloads are kept.",
+        ));
     }
+    Ok(())
 }
+/// A progress line on stderr (the result goes to stdout).
 pub fn event(state: &str, detail: serde_json::Value) {
-    eprintln!("{}", serde_json::json!({"state":state,"detail":detail}));
+    eprintln!("{}", serde_json::json!({"state": state, "detail": detail}));
 }

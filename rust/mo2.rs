@@ -2,7 +2,7 @@
 //! profile deploys, which mod each comes from, and where each mod was downloaded. Read-only.
 use crate::{
     files::{self, fold},
-    ini, snapshot, Error, Result,
+    ini, rules, Error, Result,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -51,7 +51,7 @@ fn settings(instance: &Path) -> Result<BTreeMap<String, String>> {
             format!("No ModOrganizer.ini in {}.", instance.display()),
         )
     })?;
-    let text = String::from_utf8_lossy(&files::bounded(&p, 4 * 1024 * 1024)?).into_owned();
+    let text = String::from_utf8_lossy(&std::fs::read(&p)?).into_owned();
     Ok(ini::parse(&text)
         .into_values()
         .flatten()
@@ -113,10 +113,7 @@ fn read_ini(path: &Path) -> Result<ini::Sections> {
     if !path.is_file() {
         return Ok(ini::Sections::new());
     }
-    Ok(ini::parse(&String::from_utf8_lossy(&files::bounded(
-        path,
-        1024 * 1024,
-    )?)))
+    Ok(ini::parse(&String::from_utf8_lossy(&std::fs::read(path)?)))
 }
 
 fn value<'a>(s: &'a ini::Sections, section: &str, key: &str) -> Option<&'a str> {
@@ -176,7 +173,7 @@ fn add(winners: &mut BTreeMap<String, Winner>, dir: &Path, r#mod: Option<&str>) 
     if !dir.is_dir() {
         return Ok(());
     }
-    for (rel, file) in files::inventory(dir)? {
+    for (rel, file) in files::walk(dir)? {
         let first = fold(rel.split('/').next().unwrap());
         let path = match r#mod {
             None => rel.clone(),
@@ -204,13 +201,8 @@ fn add(winners: &mut BTreeMap<String, Winner>, dir: &Path, r#mod: Option<&str>) 
     Ok(())
 }
 
-/// The profile's effective install. `game` overrides MO2's game path; `excluded` mods are left out.
-pub fn read(
-    instance: &Path,
-    profile: &str,
-    game: Option<&Path>,
-    excluded: &BTreeSet<String>,
-) -> Result<Profile> {
+/// The profile's effective install. `game` overrides MO2's game path.
+pub fn read(instance: &Path, profile: &str, game: Option<&Path>) -> Result<Profile> {
     let instance = files::root(instance)?;
     let s = settings(&instance)?;
     files::relative(profile)?;
@@ -224,7 +216,7 @@ pub fn read(
             None => instance.join("Stock Game"),
         })?,
     };
-    if files::locate(&game, "SkyrimSE.exe")?.is_none() {
+    if files::find(&game, "SkyrimSE.exe").is_none() {
         return Err(Error::new(
             "not_skyrim",
             format!("No SkyrimSE.exe in {}.", game.display()),
@@ -242,9 +234,9 @@ pub fn read(
     let mut winners = BTreeMap::new();
     add(&mut winners, &game, None)?;
     let found = winners.len();
-    winners.retain(|_, w| snapshot::from_game_folder(&w.path));
+    winners.retain(|_, w| rules::from_game_folder(&w.path));
     let unshared = found - winners.len();
-    let list = snapshot::lines(Some(&files::require(&selected, "modlist.txt")?))?;
+    let list = rules::lines(Some(&files::require(&selected, "modlist.txt")?))?;
     let mut seen = BTreeSet::new();
     let mut mods = vec![];
     // modlist.txt lists the highest priority first; apply lowest first so higher ones overwrite.
@@ -256,7 +248,7 @@ pub fn read(
                 format!("Invalid or repeated mod: {name}"),
             ));
         }
-        if excluded.contains(&fold(name)) || name.ends_with("_separator") {
+        if name.ends_with("_separator") {
             continue;
         }
         let dir = mods_dir.join(name);
@@ -265,17 +257,15 @@ pub fn read(
     }
     let overwrite = folder(&instance, &s, "overwrite_directory", "overwrite")?;
     add(&mut winners, &overwrite, Some("Overwrite"))?;
-    let logs = snapshot::known_logs(winners.values().map(|w| w.path.clone()));
     winners.retain(|_, w| {
-        !snapshot::ignored(&w.path, &logs)
-            && (!snapshot::executable(&w.path) || snapshot::protected(&w.path))
+        !rules::ignored(&w.path) && (!rules::executable(&w.path) || rules::protected(&w.path))
     });
 
-    let plugins = snapshot::lines(files::locate(&selected, "plugins.txt")?.as_deref())?;
-    let loadorder = snapshot::lines(files::locate(&selected, "loadorder.txt")?.as_deref())?;
+    let plugins = rules::lines(files::find(&selected, "plugins.txt").as_deref())?;
+    let loadorder = rules::lines(files::find(&selected, "loadorder.txt").as_deref())?;
     let mut inis = BTreeMap::new();
-    for n in snapshot::DOCUMENTS {
-        if let Some(p) = files::locate(&selected, n)? {
+    for n in rules::DOCUMENTS {
+        if let Some(p) = files::find(&selected, n) {
             inis.insert(n.to_owned(), p);
         }
     }
@@ -358,7 +348,7 @@ mod tests {
     fn reads_priorities_root_files_and_origins() {
         let dir = tempfile::tempdir().unwrap();
         fixture::instance(dir.path());
-        let p = read(&dir.path().join("mo2"), "Default", None, &BTreeSet::new()).unwrap();
+        let p = read(&dir.path().join("mo2"), "Default", None).unwrap();
         let shared = &p.files["data/textures/shared.dds"];
         assert_eq!(shared.r#mod.as_deref(), Some("B"));
         assert_eq!(std::fs::read(&shared.file).unwrap(), b"from-b");
@@ -371,22 +361,6 @@ mod tests {
         assert!(a.archive.is_some());
         assert_eq!(p.plugins, ["*A.esp", "*B.esp"]);
         assert!(p.inis.contains_key("Skyrim.ini"));
-    }
-    #[test]
-    fn excluded_mods_leave_the_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        fixture::instance(dir.path());
-        let p = read(
-            &dir.path().join("mo2"),
-            "Default",
-            None,
-            &["b".to_string()].into(),
-        )
-        .unwrap();
-        assert_eq!(
-            p.files["data/textures/shared.dds"].r#mod.as_deref(),
-            Some("A")
-        );
     }
     #[test]
     fn wine_paths_map_to_the_unix_root() {

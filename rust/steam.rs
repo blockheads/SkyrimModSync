@@ -137,7 +137,8 @@ pub fn installs(roots: &[PathBuf]) -> Vec<Install> {
         }
         libraries.insert(root.clone());
         let metadata = root.join("steamapps/libraryfolders.vdf");
-        if let Ok(v) = files::bounded(&metadata, 4 * 1024 * 1024)
+        if let Ok(v) = std::fs::read(&metadata)
+            .map_err(crate::Error::from)
             .and_then(|b| vdf(&String::from_utf8_lossy(&b)))
         {
             if let Some(entries) = v["libraryfolders"].as_object() {
@@ -155,8 +156,8 @@ pub fn installs(roots: &[PathBuf]) -> Vec<Install> {
     let mut found = vec![];
     for library in libraries {
         let apps = library.join("steamapps");
-        let Ok(bytes) =
-            files::bounded(&apps.join(format!("appmanifest_{APP_ID}.acf")), 1024 * 1024)
+        let Ok(bytes) = std::fs::read(apps.join(format!("appmanifest_{APP_ID}.acf")))
+            .map_err(crate::Error::from)
         else {
             continue;
         };

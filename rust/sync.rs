@@ -1,171 +1,116 @@
-//! Sync: making the store hold every file of a pack the friend's game lacks. Archives come from Nexus
-//! (the friend's Premium key) or their URL, only the needed members are kept; the rest from the host.
+//! Sync: the store gets every pack file the game lacks. Archives come from Nexus (a Premium key) or
+//! their URL, three at a time, keeping only the files needed; anything else, or any archive that fails,
+//! comes from the host.
 use crate::{
     archive,
-    channel::{self, Channel, Head},
-    config, deploy, hashes, net, nexus,
-    pack::{Origin, Pack, Source},
+    deploy::{self, Game},
+    files,
+    net::Net,
+    pack::{Archive, Entry, From, Origin, Pack},
     peer,
-    store::{Current, Store},
+    store::Store,
     Error, Result,
 };
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    path::Path,
+    path::PathBuf,
 };
 
-/// Where a pack comes from: a host's code, or a pack file.
-pub fn resolve(
-    code_or_file: &str,
-    store: &Store,
-    direct: Option<SocketAddr>,
-) -> Result<(Pack, Head)> {
-    let path = Path::new(code_or_file);
-    if path.is_file() {
-        let (pack, head) = channel::read_file(path)?;
-        store.accept(&head)?;
-        return Ok((pack, head));
-    }
-    let channel = Channel::parse(code_or_file.trim())?;
-    peer::fetch_pack(&channel, store, None, direct)
-}
+const DOWNLOADS: usize = 3;
 
-/// Fetches what the store and the game lack for `pack`; on success it becomes the store's pack.
 pub fn sync(
     pack: &Pack,
-    head: &Head,
+    game: &Game,
     store: &Store,
-    game: &deploy::Game,
+    net: &Net,
     direct: Option<SocketAddr>,
-    local: Option<&BTreeMap<String, std::path::PathBuf>>,
 ) -> Result<Value> {
-    let _lock = crate::files::Lock::take(&store.root.join("locks/sync.lock"))?;
-    let mut cache = hashes::Cache::open(&store.root.join("hashes.json"))?;
-    let originals = game.originals()?;
-    let mut base_differs = vec![];
-    let mut need = vec![];
-    for e in &pack.files {
-        let original = match originals.get(&e.path)? {
-            Some(p) => cache.holds(&p, &e.sha256)?,
-            None => false,
-        };
-        if original {
-            continue;
-        }
-        if e.source == Source::Base {
-            base_differs.push(e.path.clone());
-        } else if !store.has(&e.sha256, e.size) {
-            need.push(e);
-        }
-    }
-    cache.save()?;
-    if !base_differs.is_empty() {
-        return Err(Error::new(
-            "game_differs",
-            format!(
-                "Your game's own files differ from the host's ({} files, first: {}). Check you both have the same Skyrim version and edition (Anniversary content), then verify the game's files in Steam.",
-                base_differs.len(),
-                base_differs[0]
-            ),
-        ));
-    }
-
-    // The host playing its own pack: every file is already on this machine.
-    let mut from_local = 0;
-    if let Some(local) = local {
-        for e in &need {
-            if let Some(path) = local.get(&e.sha256) {
-                store.take_local(path, &e.sha256, e.size)?;
-                from_local += 1;
-            }
-        }
-    }
-    let need = need
-        .into_iter()
-        .filter(|e| !store.has(&e.sha256, e.size))
-        .collect::<Vec<_>>();
-    let mut by_archive: BTreeMap<&str, BTreeMap<String, (&str, u64)>> = BTreeMap::new();
-    let mut from_host = vec![];
-    for e in &need {
-        match &e.source {
-            Source::Archive { archive, member } => {
-                by_archive
-                    .entry(archive)
-                    .or_default()
-                    .insert(member.clone(), (&e.sha256, e.size));
-            }
-            Source::Host { blob } => from_host.push((blob.clone(), e.sha256.clone(), e.size)),
-            Source::Base => {}
-        }
-    }
-    let nexus_needed = by_archive
-        .keys()
-        .filter_map(|a| pack.archive(a))
-        .filter(|a| {
-            matches!(a.origin, Origin::Nexus { .. }) && !store.downloads().join(&a.sha256).is_file()
-        })
-        .collect::<Vec<_>>();
-    let key = config::nexus_key()?;
-    if !nexus_needed.is_empty() && key.is_none() {
-        return Err(Error::new(
-            "nexus_key_required",
-            format!(
-                "{} archives come from Nexus (first: {}). Run `sms nexus-login` with a Premium account's API key, or ask the host to send them (`sms host source <mod> host`).",
-                nexus_needed.len(),
-                nexus_needed[0].name
-            ),
-        ));
-    }
-    let client = net::client()?;
-    let mut downloaded = 0u64;
-    for (sha, members) in &by_archive {
-        let a = pack
-            .archive(sha)
-            .ok_or_else(|| Error::new("invalid_pack", "Unknown archive."))?;
-        crate::event("archive", json!({"name": a.name, "size": a.size}));
-        let cached = store.downloads().join(&a.sha256);
-        let path = if cached.is_file() {
-            cached
-        } else {
-            let url = match &a.origin {
-                Origin::Url { url } => url.clone(),
-                Origin::Nexus { game, r#mod, file } => {
-                    nexus::download_link(key.as_deref().unwrap(), game, *r#mod, *file)?
-                }
-            };
-            downloaded += a.size;
-            net::download(&client, &url, &store.downloads(), Some((a.size, &a.sha256)))?
-        };
-        let wanted = members.keys().cloned().collect::<BTreeSet<_>>();
-        let folded = members
-            .iter()
-            .map(|(m, v)| (crate::files::fold(m), *v))
-            .collect::<BTreeMap<_, _>>();
-        archive::extract(&path, &wanted, |name, r| {
-            let (sha256, size) = folded[&crate::files::fold(name)];
-            store.put(r, sha256, size)
-        })?;
-    }
-    let host_bytes: u64 = from_host.iter().map(|(_, _, s)| s).sum();
-    if !from_host.is_empty() {
-        peer::fetch_objects(&head.channel, store, &from_host, direct)?;
-    }
-    store.set_current(&Current {
-        pack: pack.clone(),
-        head: head.clone(),
+    let _lock = files::Lock::take(&store.root.join("lock"))?;
+    let mut cache = store.hashes();
+    let plan = deploy::plan(pack, game, &mut cache, |e| {
+        store.has(&e.hash, e.size).then(|| store.object(&e.hash))
     })?;
+    if let Some(p) = plan.differs.first() {
+        return Err(Error::new("game_differs", format!("Your game's {p} differs from the host's: same Skyrim version and edition? Verify the game's files in Steam.")));
+    }
+    let mut by_archive: BTreeMap<&str, Vec<&Entry>> = BTreeMap::new();
+    let mut from_host: Vec<&Entry> = vec![];
+    for e in &plan.missing {
+        match &e.from {
+            From::Archive { archive, .. } => by_archive.entry(archive).or_default().push(e),
+            _ => from_host.push(e),
+        }
+    }
+    let jobs: Vec<(&Archive, Vec<&Entry>)> = by_archive
+        .into_iter()
+        .filter_map(|(h, es)| pack.archive(h).map(|a| (a, es)))
+        .collect();
+    let mut failed = vec![];
+    for chunk in jobs.chunks(DOWNLOADS) {
+        let results: Vec<Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(a, es)| s.spawn(|| fetch_archive(a, es, store, net)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::new("crashed", "A download thread failed.")))
+                })
+                .collect()
+        });
+        for ((a, es), r) in chunk.iter().zip(results) {
+            if let Err(e) = r {
+                crate::event(
+                    "archive_from_host",
+                    json!({"archive": a.name, "why": e.message}),
+                );
+                failed.push(a.name.clone());
+                from_host.extend(es.iter().copied());
+            }
+        }
+    }
+    let wanted: BTreeSet<(String, u64)> =
+        from_host.iter().map(|e| (e.hash.clone(), e.size)).collect();
+    let wanted: Vec<(String, u64)> = wanted.into_iter().collect();
+    peer::fetch_files(&pack.host, direct, store, &wanted)?;
+    store.set_pack(pack)?;
     Ok(json!({
         "state": "synced",
         "pack": pack.name,
-        "revision": head.revision,
-        "sequence": head.sequence,
-        "files_fetched": need.len(),
-        "files_local": from_local,
-        "archives": by_archive.len(),
-        "downloaded_bytes": downloaded,
-        "host_files": from_host.len(),
-        "host_bytes": host_bytes,
+        "files_fetched": plan.missing.len(),
+        "archives": jobs.len() - failed.len(),
+        "archives_from_host": failed,
+        "host_files": wanted.len(),
+        "host_bytes": wanted.iter().map(|w| w.1).sum::<u64>(),
     }))
+}
+
+/// One archive: from the store's downloads, else downloaded; the needed members into the store.
+fn fetch_archive(a: &Archive, entries: &[&Entry], store: &Store, net: &Net) -> Result<()> {
+    let cached: PathBuf = store.downloads().join(&a.hash);
+    let path = if cached.is_file() {
+        cached
+    } else {
+        let url = match &a.origin {
+            Origin::Url { url } => url.clone(),
+            Origin::Nexus { game, r#mod, file } => net.nexus_link(game, *r#mod, *file)?,
+        };
+        crate::event("downloading", json!({"archive": a.name, "size": a.size}));
+        net.download(&url, &store.downloads(), Some((a.size, &a.hash)))?
+    };
+    let members: BTreeMap<String, &str> = entries
+        .iter()
+        .filter_map(|e| match &e.from {
+            From::Archive { member, .. } => Some((files::fold(member), e.hash.as_str())),
+            _ => None,
+        })
+        .collect();
+    let wanted: BTreeSet<String> = members.keys().cloned().collect();
+    archive::extract(&path, &wanted, |name, r| {
+        store.put(r, members[&files::fold(name)])
+    })
 }
