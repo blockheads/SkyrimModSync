@@ -46,6 +46,18 @@ impl Store {
         temp.persist(&dest).map_err(|e| Error::from(e.error))?;
         Ok(())
     }
+    /// A file already on this machine and already checked (the host's own), linked in or copied.
+    pub fn take(&self, path: &Path, hash: &str) -> Result<()> {
+        let dest = self.object(hash);
+        if dest.is_file() {
+            return Ok(());
+        }
+        fs::create_dir_all(dest.parent().unwrap())?;
+        if fs::hard_link(path, &dest).is_err() {
+            self.put(&mut fs::File::open(path)?, hash)?;
+        }
+        Ok(())
+    }
     pub fn pack(&self) -> Result<Option<Pack>> {
         let p = self.root.join("pack.json");
         if !p.is_file() {

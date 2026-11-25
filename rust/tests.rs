@@ -1,9 +1,8 @@
-//! Whole flows on fake games: a host publishes an MO2 profile, a friend syncs it (a fake Nexus and
-//! GitHub, the host over a local iroh connection), loads, plays, unloads back to the same bytes.
+//! Whole flows on fake games: a host publishes a mod list (a fake Nexus and GitHub serve its archives),
+//! a friend syncs it (from those, or from the host over a local iroh connection), loads, unloads.
 use crate::{
     deploy::{self, Game},
-    host::{Binding, Host, Source},
-    mo2,
+    host::Host,
     net::Net,
     pack::{From, Origin},
     peer,
@@ -13,12 +12,12 @@ use crate::{
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
 };
 
@@ -26,6 +25,16 @@ fn write(root: &Path, rel: &str, bytes: &[u8]) {
     let p = root.join(rel);
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(p, bytes).unwrap();
+}
+
+fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(vec![]));
+    for (n, b) in entries {
+        z.start_file(*n, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(b).unwrap();
+    }
+    z.finish().unwrap().into_inner()
 }
 
 /// Every file under the folders: relative path -> bytes.
@@ -39,31 +48,60 @@ fn tree(roots: &[&Path]) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
-/// A fake Nexus and GitHub on plain HTTP: mod 100 file 200 and repo fake/mod are the A archive.
-fn fake_api(zip: Vec<u8>) -> String {
+/// A fake Nexus and GitHub on plain HTTP. Nexus mod 100 file 200 is A.zip; fake/skse's newest release
+/// has skse.zip; fake/pack's has pack.json (whatever the test puts in `pack`).
+fn fake_api(pack: Arc<Mutex<Vec<u8>>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let link = format!("{base}/dl/A.zip");
+    let a = zip(&[
+        ("A.esp", b"a-plugin"),
+        ("textures/shared.dds", b"from-a"),
+        ("fomod/info.xml", b"x"),
+    ]);
+    let skse = zip(&[
+        ("skse64_2/skse64_loader.exe", b"loader"),
+        ("skse64_2/Data/Scripts/a.pex", b"script"),
+        ("skse64_2/src/x.cpp", b"source"),
+    ]);
+    let b = base.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
             let mut reader = BufReader::new(s.try_clone().unwrap());
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
-            let mut line = String::new();
+            let (mut line, mut free) = (String::new(), false);
             while reader.read_line(&mut line).unwrap() > 2 {
+                free |= line.to_lowercase().starts_with("apikey: free");
                 line.clear();
             }
-            let (status, body): (&str, Vec<u8>) = match first.split_whitespace().nth(1).unwrap_or("") {
-                "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json" => {
-                    ("200 OK", format!(r#"[{{"URI":"{link}"}}]"#).into_bytes())
-                }
-                "/dl/A.zip" => ("200 OK", zip.clone()),
-                "/repos/fake/mod/releases?per_page=10" => ("200 OK", format!(
-                    r#"[{{"draft":false,"assets":[{{"name":"notes.txt"}},{{"name":"A-1.0.zip","browser_download_url":"{link}"}}]}}]"#
-                ).into_bytes()),
-                _ => ("404 Not Found", b"{}".to_vec()),
+            let release = |name: &str| {
+                format!(r#"[{{"draft":false,"assets":[{{"name":"notes.txt"}},{{"name":"{name}","browser_download_url":"{b}/dl/{name}"}}]}}]"#).into_bytes()
             };
+            let (status, body): (&str, Vec<u8>) =
+                match first.split_whitespace().nth(1).unwrap_or("") {
+                    "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json"
+                        if free =>
+                    {
+                        ("403 Forbidden", b"{}".to_vec())
+                    }
+                    "/v1/games/skyrimspecialedition/mods/100/files/200.json" => {
+                        ("200 OK", br#"{"file_name":"A-100-1-0.zip"}"#.to_vec())
+                    }
+                    "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json" => (
+                        "200 OK",
+                        format!(r#"[{{"URI":"{b}/dl/A.zip"}}]"#).into_bytes(),
+                    ),
+                    "/v1/games/skyrimspecialedition/mods/100.json" => {
+                        ("200 OK", br#"{"name":"Mod A"}"#.to_vec())
+                    }
+                    "/repos/fake/skse/releases?per_page=10" => ("200 OK", release("skse.zip")),
+                    "/repos/fake/pack/releases?per_page=10" => ("200 OK", release("pack.json")),
+                    "/dl/A.zip" => ("200 OK", a.clone()),
+                    "/dl/skse.zip" => ("200 OK", skse.clone()),
+                    "/dl/pack.json" => ("200 OK", pack.lock().unwrap().clone()),
+                    _ => ("404 Not Found", b"{}".to_vec()),
+                };
             let _ = write!(
                 s,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -75,47 +113,43 @@ fn fake_api(zip: Vec<u8>) -> String {
     base
 }
 
-/// An MO2 host with loose and private files that must never be shared, and a friend's own game.
+const LIST: &str = r#"{
+  "name": "Test",
+  "mods": [
+    { "name": "SKSE", "github": { "repo": "fake/skse" }, "folder": "skse64_2", "root": ["skse64_loader.exe"] },
+    { "name": "A", "nexus": { "mod": 100, "file": 200 } },
+    { "name": "B", "local": "B", "root": ["d3dx9_42.dll"] }
+  ],
+  "plugins": ["A.esp", "B.esp"],
+  "ini": { "Skyrim.ini": { "General": { "uGridsToLoad": "5" } } }
+}"#;
+
+/// A host (its game with private files that must never be shared, a mod list) and a friend's game.
 struct World {
     _dir: tempfile::TempDir,
     root: PathBuf,
     host: Host,
     api: String,
+    pack: Arc<Mutex<Vec<u8>>>,
     friend: Game,
 }
-
-const PRIVATE: [&str; 5] = [
-    "game/SkyrimSE_1.7.104.exe",
-    "game/Data/Video/logo.bik",
-    "game/Data/HandInstalled.esp",
-    "game/Data/SKSE/Plugins/logs/tp_client.log",
-    "mo2/overwrite/SKSE/Plugins/logs/tp_client.1.log",
-];
 
 fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    mo2::fixture::instance(&root);
-    write(&root, "game/skse64_loader.exe", b"loader");
-    for p in PRIVATE {
+    write(&root, "game/SkyrimSE.exe", b"exe");
+    write(&root, "game/Data/Skyrim.esm", b"esm");
+    for p in [
+        "game/SkyrimSE_1.7.104.exe",
+        "game/Data/HandInstalled.esp",
+        "game/Data/SKSE/Plugins/logs/x.log",
+    ] {
         write(&root, p, b"private");
     }
-    let mut zip = vec![];
-    fs::File::open(root.join("mo2/downloads/A-100-1-0.zip"))
-        .unwrap()
-        .read_to_end(&mut zip)
-        .unwrap();
-    let host = Host {
-        dir: root.join("host"),
-    };
-    host.init(Binding {
-        name: "Test".into(),
-        mo2: root.join("mo2"),
-        profile: "Default".into(),
-        game: None,
-        sources: Default::default(),
-    })
-    .unwrap();
+    write(&root, "list/modlist.json", LIST.as_bytes());
+    write(&root, "list/B/B.esp", b"b-plugin");
+    write(&root, "list/B/textures/shared.dds", b"from-b");
+    write(&root, "list/B/d3dx9_42.dll", b"root-file");
     let f = root.join("friend");
     write(&f, "game/SkyrimSE.exe", b"exe");
     write(&f, "game/Data/Skyrim.esm", b"esm");
@@ -139,11 +173,16 @@ fn world() -> World {
         local: f.join("local"),
         documents: f.join("docs"),
     };
+    let pack = Arc::new(Mutex::new(vec![]));
+    let api = fake_api(pack.clone());
     World {
         _dir: dir,
+        host: Host {
+            dir: root.join("host"),
+        },
         root,
-        host,
-        api: fake_api(zip),
+        api,
+        pack,
         friend,
     }
 }
@@ -155,9 +194,23 @@ impl World {
     fn store(&self) -> Store {
         Store::open(&self.root.join("friend/store")).unwrap()
     }
-    /// Publishes and serves on a local port until the returned flag is set.
+    /// Publishes (the host has a key) and puts the pack on the fake GitHub.
+    fn publish(&self) -> serde_json::Value {
+        let out = self.root.join("pack.json");
+        let r = self
+            .host
+            .publish(
+                &self.root.join("list/modlist.json"),
+                &self.root.join("game"),
+                &self.net(Some("host")),
+                Some(&out),
+            )
+            .unwrap();
+        *self.pack.lock().unwrap() = fs::read(out).unwrap();
+        r
+    }
+    /// Serves on a local port until the returned flag is set.
     fn serve(&self) -> (SocketAddr, Arc<AtomicBool>) {
-        self.host.publish(&self.net(None)).unwrap();
         let addr: SocketAddr = UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -182,17 +235,10 @@ impl World {
         rx.recv().unwrap();
         (addr, stop)
     }
-    fn sync(&self, key: Option<&str>, addr: SocketAddr) -> serde_json::Value {
-        let pack =
-            peer::fetch_pack(&self.host.key().unwrap().public().to_string(), Some(addr)).unwrap();
-        sync::sync(
-            &pack,
-            &self.friend,
-            &self.store(),
-            &self.net(key),
-            Some(addr),
-        )
-        .unwrap()
+    fn sync(&self, source: &str, key: Option<&str>, addr: Option<SocketAddr>) -> serde_json::Value {
+        let net = self.net(key);
+        let pack = sync::fetch_pack(source, &net, addr).unwrap();
+        sync::sync(&pack, &self.friend, &self.store(), &net, addr, None).unwrap()
     }
     fn load(&self) -> serde_json::Value {
         let st = self.store();
@@ -220,76 +266,65 @@ impl World {
 }
 
 #[test]
-fn a_draft_finds_sources_by_hash_and_never_shares_private_files() {
+fn a_list_resolves_by_its_install_rules_and_never_shares_private_files() {
     let w = world();
-    let d = w.host.draft(&w.net(None)).unwrap();
+    w.publish();
+    let pack = w.host.published().unwrap().unwrap().pack;
     let from = |p: &str| {
-        d.published
-            .pack
-            .files
+        pack.files
             .iter()
             .find(|e| e.path.eq_ignore_ascii_case(p))
-            .unwrap()
-            .from
-            .clone()
+            .map(|e| e.from.clone())
     };
-    assert!(matches!(from("Data/A.esp"), From::Archive { .. }));
+    assert!(matches!(from("Data/A.esp"), Some(From::Archive { .. })));
     assert_eq!(
         from("Data/textures/shared.dds"),
-        From::Host,
-        "B wins over A's copy; B has no archive"
+        Some(From::Host),
+        "B comes later and wins"
     );
-    assert_eq!(from("Data/Skyrim.esm"), From::Base);
-    let private = blake3::hash(b"private").to_hex().to_string();
-    assert!(d.published.pack.files.iter().all(|e| e.hash != private));
-    let source = |m: &str| d.mods.iter().find(|r| r.name == m).unwrap().source.clone();
-    assert_eq!((source("A"), source("B")), ("nexus".into(), "host".into()));
+    assert!(
+        matches!(from("skse64_loader.exe"), Some(From::Archive { .. })),
+        "root file"
+    );
+    assert!(
+        matches!(from("Data/Scripts/a.pex"), Some(From::Archive { .. })),
+        "SKSE's Data/"
+    );
+    assert_eq!(from("d3dx9_42.dll"), Some(From::Host));
+    assert_eq!(from("Data/Skyrim.esm"), Some(From::Base));
+    for skipped in [
+        "Data/src/x.cpp",
+        "src/x.cpp",
+        "Data/fomod/info.xml",
+        "Data/HandInstalled.esp",
+        "SkyrimSE_1.7.104.exe",
+    ] {
+        assert_eq!(from(skipped), None, "{skipped}");
+    }
+    assert_eq!(pack.plugins, ["*A.esp", "*B.esp"]);
+    assert_eq!(pack.loadorder, ["Skyrim.esm", "A.esp", "B.esp"]);
+    assert!(pack
+        .archives
+        .iter()
+        .any(|a| matches!(&a.origin, Origin::Url { url } if url.ends_with("/dl/skse.zip"))));
 }
 
 #[test]
-fn a_github_source_is_the_newest_releases_archive() {
-    let w = world();
-    w.host
-        .set_source(
-            "A",
-            Some(Source::Github {
-                repo: "fake/mod".into(),
-                asset: None,
-            }),
-        )
-        .unwrap();
-    let d = w.host.draft(&w.net(None)).unwrap();
-    let a = &d.published.pack.archives[0];
-    assert!(matches!(&a.origin, Origin::Url { url } if url.ends_with("/dl/A.zip")));
-}
-
-#[test]
-fn without_a_key_everything_comes_from_the_host() {
-    let w = world();
-    let (addr, stop) = w.serve();
-    let synced = w.sync(None, addr);
-    stop.store(true, Ordering::Relaxed);
-    assert_eq!(synced["archives"], 0);
-    assert_eq!(synced["archives_from_host"].as_array().unwrap().len(), 1);
-    w.load();
-    assert_eq!(w.read("Data/A.esp"), b"a-plugin");
-}
-
-#[test]
-fn friend_syncs_loads_and_unloads_to_the_same_bytes() {
+fn a_friend_with_a_key_plays_from_a_github_link_with_no_host_and_unloads_to_the_same_bytes() {
     let w = world();
     let before = w.friend_tree();
+    w.publish();
+    // Only B's files come from the host: give them its own copy as if served, then the rest by link.
     let (addr, stop) = w.serve();
-    let synced = w.sync(Some("premium"), addr);
+    let synced = w.sync("github:fake/pack", Some("friend"), Some(addr));
     stop.store(true, Ordering::Relaxed);
-    assert_eq!(synced["archives"], 1, "A from the fake Nexus");
-    assert_eq!(w.store().pack().unwrap().unwrap().name, "Test");
+    assert_eq!(synced["archives"], 2, "SKSE from GitHub, A from Nexus");
+    assert_eq!(synced["host_files"], 3, "B's files only");
 
     let loaded = w.load();
-    assert!(loaded["placed"].as_u64().unwrap() >= 5);
+    assert!(loaded["placed"].as_u64().unwrap() >= 6);
     assert_eq!(w.read("Data/A.esp"), b"a-plugin");
     assert_eq!(w.read("Data/textures/shared.dds"), b"from-b");
-    assert_eq!(w.read("d3dx9_42.dll"), b"root-file");
     assert_eq!(
         w.read("SkyrimSELauncher.exe"),
         b"loader",
@@ -312,22 +347,59 @@ fn friend_syncs_loads_and_unloads_to_the_same_bytes() {
         ),
         ("5", "ENGLISH")
     );
-    assert_eq!(
-        fs::read(w.friend.documents.join("SkyrimPrefs.ini")).unwrap(),
-        b"[Display]\niSize W=1920\n"
-    );
-    assert!(matches!(w.friend.state(), deploy::State::Loaded(_)));
 
     deploy::unload(&w.friend).unwrap();
     assert_eq!(w.friend_tree(), before);
 }
 
 #[test]
+fn a_pack_without_host_files_needs_no_host() {
+    let w = world();
+    let list = LIST
+        .replace(
+            r#",
+    { "name": "B", "local": "B", "root": ["d3dx9_42.dll"] }"#,
+            "",
+        )
+        .replace(r#", "B.esp""#, "");
+    write(&w.root, "list/modlist.json", list.as_bytes());
+    w.publish();
+    let synced = w.sync("github:fake/pack", Some("friend"), None);
+    assert_eq!(synced["host_files"], 0);
+    w.load();
+    assert_eq!(w.read("Data/A.esp"), b"a-plugin");
+}
+
+#[test]
+fn without_a_key_nexus_mods_come_from_the_host() {
+    let w = world();
+    w.publish();
+    let (addr, stop) = w.serve();
+    let code = w.host.key().unwrap().public().to_string();
+    let synced = w.sync(&code, None, Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(synced["archives"], 1, "GitHub needs no key");
+    assert_eq!(
+        synced["archives_from_host"].as_array().unwrap().len(),
+        1,
+        "the Nexus one"
+    );
+    w.load();
+    assert_eq!(
+        w.read("Data/A.esp"),
+        b"a-plugin",
+        "extracted by the host from its archive"
+    );
+    assert_eq!(w.read("Data/Scripts/a.pex"), b"script");
+}
+
+#[test]
 fn a_load_cut_short_is_undone() {
     let w = world();
     let before = w.friend_tree();
+    w.publish();
     let (addr, stop) = w.serve();
-    w.sync(Some("premium"), addr);
+    w.sync("github:fake/pack", Some("friend"), Some(addr));
     stop.store(true, Ordering::Relaxed);
     w.load();
     fs::remove_file(w.friend.root.join(".skyrim-mod-sync/loaded")).unwrap();
@@ -339,8 +411,9 @@ fn a_load_cut_short_is_undone() {
 #[test]
 fn a_cut_host_transfer_resumes() {
     let w = world();
+    w.publish();
     let (addr, stop) = w.serve();
-    let pack = peer::fetch_pack(&w.host.key().unwrap().public().to_string(), Some(addr)).unwrap();
+    let pack = w.host.published().unwrap().unwrap().pack;
     let shared = pack
         .files
         .iter()
@@ -368,28 +441,33 @@ fn a_cut_host_transfer_resumes() {
 #[test]
 fn the_host_plays_its_own_pack_from_its_own_files() {
     let w = world();
-    w.host.publish(&w.net(None)).unwrap();
-    let published = w.host.published().unwrap().unwrap();
+    w.publish();
+    let own = w.host.published().unwrap().unwrap();
     let game = Game {
         root: w.root.join("game"),
         local: w.root.join("host-local"),
         documents: w.root.join("host-docs"),
     };
     let before = tree(&[&game.root]);
-    let plan = deploy::plan(
-        &published.pack,
-        &game,
-        &mut crate::hash::Cache::open(&w.root.join("h.json")),
-        |e| published.local.get(&e.hash).cloned(),
-    )
+    let st = Store::open(&w.root.join("host-store")).unwrap();
+    let synced = sync::sync(&own.pack, &game, &st, &w.net(None), None, Some(&own)).unwrap();
+    assert!(synced["files_local"].as_u64().unwrap() >= 6);
+    let plan = deploy::plan(&own.pack, &game, &mut st.hashes(), |e| {
+        st.has(&e.hash, e.size).then(|| st.object(&e.hash))
+    })
     .unwrap();
     deploy::load(&game, &plan, "Test").unwrap();
+    assert_eq!(fs::read(game.root.join("Data/A.esp")).unwrap(), b"a-plugin");
     assert_eq!(
-        fs::read(game.root.join("Data/textures/shared.dds")).unwrap(),
-        b"from-b"
-    );
-    assert_eq!(
-        w.host.publish(&w.net(None)).unwrap_err().code,
+        w.host
+            .publish(
+                &w.root.join("list/modlist.json"),
+                &game.root,
+                &w.net(Some("k")),
+                None
+            )
+            .unwrap_err()
+            .code,
         "pack_loaded"
     );
     deploy::unload(&game).unwrap();
@@ -397,20 +475,70 @@ fn the_host_plays_its_own_pack_from_its_own_files() {
 }
 
 #[test]
+fn without_premium_the_host_downloads_nexus_archives_by_hand() {
+    let w = world();
+    let list = w.root.join("list/modlist.json");
+    let game = w.root.join("game");
+    let err = w
+        .host
+        .publish(&list, &game, &w.net(Some("free")), None)
+        .unwrap_err();
+    assert_eq!(err.code, "manual_download");
+    assert!(
+        err.message.contains("A-100-1-0.zip") && err.message.contains("file_id=200"),
+        "{}",
+        err.message
+    );
+    let a = zip(&[
+        ("A.esp", b"a-plugin"),
+        ("textures/shared.dds", b"from-a"),
+        ("fomod/info.xml", b"x"),
+    ]);
+    write(&w.root, "list/downloads/A-100-1-0.zip", &a);
+    w.host
+        .publish(&list, &game, &w.net(Some("free")), None)
+        .unwrap();
+    let pack = w.host.published().unwrap().unwrap().pack;
+    let a = pack
+        .archives
+        .iter()
+        .find(|a| matches!(a.origin, Origin::Nexus { r#mod: 100, .. }))
+        .unwrap();
+    assert_eq!(a.name, "A-100-1-0.zip");
+}
+
+#[test]
+fn add_appends_a_nexus_mod_from_its_link() {
+    let w = world();
+    let list = w.root.join("new.json");
+    let r = w
+        .host
+        .add(
+            &list,
+            "https://www.nexusmods.com/skyrimspecialedition/mods/100?tab=files&file_id=200",
+            &w.net(Some("k")),
+        )
+        .unwrap();
+    assert_eq!(r["mod"], "Mod A");
+    let read = crate::list::ModList::read(&list).unwrap();
+    assert_eq!(
+        read.mods[0].nexus.as_ref().map(|n| (n.r#mod, n.file)),
+        Some((100, 200))
+    );
+}
+
+#[test]
 fn clean_keeps_only_what_the_pack_uses() {
     let w = world();
+    w.publish();
     let (addr, stop) = w.serve();
-    w.sync(Some("premium"), addr);
+    w.sync("github:fake/pack", Some("friend"), Some(addr));
     stop.store(true, Ordering::Relaxed);
     let st = w.store();
     write(&st.root, "objects/ff/ffff", b"stale");
     assert_eq!(st.clean().unwrap(), 5);
-    assert!(!st.root.join("objects/ff/ffff").exists());
-    assert!(w
-        .store()
-        .pack()
-        .unwrap()
-        .unwrap()
+    let pack = st.pack().unwrap().unwrap();
+    assert!(pack
         .files
         .iter()
         .filter(|e| e.from != From::Base)

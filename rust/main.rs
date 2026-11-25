@@ -4,10 +4,9 @@ use skyrim_mod_sync::{
     config::{self, Settings},
     deploy::{self, Game},
     files,
-    host::{Binding, Host, Source},
+    host::Host,
     launch,
     net::Net,
-    pack::Pack,
     peer, steam,
     store::Store,
     sync, Error, Result,
@@ -15,10 +14,7 @@ use skyrim_mod_sync::{
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Share a Skyrim mod setup with friends: sync it, load it into the game, play, unload"
-)]
+#[command(version, about = "Play Skyrim with your friends' exact mod setup")]
 struct Cli {
     /// Machine-readable output: one JSON result on stdout, progress on stderr; never prompts.
     #[arg(long, global = true)]
@@ -27,9 +23,12 @@ struct Cli {
     command: Command,
 }
 
+/// A pack: `github:OWNER/REPO` (its newest release's pack.json), a pack URL or file, or a host's code.
+const PACK: &str = "github:OWNER/REPO, a pack URL or file, or a host's code";
+
 #[derive(Subcommand)]
 enum Command {
-    /// Find Skyrim and choose the store folder (where synced files live).
+    /// Find Skyrim, choose where synced mods live, and give your Nexus API key.
     Setup {
         #[arg(long)]
         game: Option<PathBuf>,
@@ -41,34 +40,34 @@ enum Command {
         /// The game's Documents/My Games/Skyrim Special Edition (found automatically).
         #[arg(long)]
         documents: Option<PathBuf>,
-    },
-    /// Save a Nexus API key (optional: Premium makes Nexus mods download from Nexus, not the host).
-    NexusLogin {
+        /// Read the Nexus API key from one line of standard input.
         #[arg(long)]
-        stdin: bool,
+        key_stdin: bool,
     },
-    /// Fetch the host's pack into the store (the code is only needed the first time).
-    Sync {
-        code: Option<String>,
+    /// Sync, load and start Skyrim through Steam. Without a pack: your last one (the host: its own).
+    Play {
+        #[arg(help = PACK)]
+        pack: Option<String>,
         /// Reach the host at this address directly (local tests).
         #[arg(long)]
         peer_address: Option<SocketAddr>,
     },
-    /// Put the pack into the game folder (the host: its own published pack).
-    Load,
-    /// Take the pack out of the game folder, restoring everything that was there.
-    Unload,
-    /// What is synced and loaded.
-    Status,
-    /// Sync, load and start Skyrim through Steam (the host: its own pack, nothing to sync).
-    Play {
-        code: Option<String>,
+    /// Fetch a pack's files into the store without loading.
+    Sync {
+        #[arg(help = PACK)]
+        pack: Option<String>,
         #[arg(long)]
         peer_address: Option<SocketAddr>,
     },
+    /// Put the synced pack into the game folder.
+    Load,
+    /// Take the pack out of the game folder, restoring everything that was there.
+    Unload,
+    /// What is set up, synced and loaded.
+    Status,
     /// Delete store files the current pack no longer uses.
     Clean,
-    /// Publishing your MO2 profile.
+    /// Make a pack from a mod list and share it.
     Host {
         #[command(subcommand)]
         command: HostCommand,
@@ -77,36 +76,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Choose the MO2 instance and profile to publish.
-    Init {
+    /// Resolve a mod list into a pack; prints your code (it never changes).
+    Publish {
+        list: PathBuf,
+        /// Also write the pack to a file (e.g. to attach to a release).
         #[arg(long)]
-        mo2: PathBuf,
-        #[arg(long)]
-        profile: String,
-        /// The pack's name friends see (default: the profile's).
-        #[arg(long)]
-        name: Option<String>,
-        /// The game folder, when MO2's own setting doesn't point at it.
-        #[arg(long)]
-        game: Option<PathBuf>,
+        output: Option<PathBuf>,
     },
-    /// Every mod, where friends get it, and what you would send.
-    Status,
-    /// Where a mod's files come from: `nexus` (MO2's record), `host`, `url URL`, `github OWNER/REPO [ASSET]`.
-    Source {
-        r#mod: String,
-        kind: String,
-        value: Option<String>,
-        asset: Option<String>,
-    },
-    /// Publish the current profile; prints the code for friends (it stays the same).
-    Publish,
-    /// Send your files to friends until stopped (Ctrl-C).
+    /// Send files to friends who have no Nexus key, or whose downloads fail (Ctrl-C to stop).
     Serve {
         /// Listen on this address without relays (local tests).
         #[arg(long)]
         bind: Option<SocketAddr>,
     },
+    /// Add a Nexus mod to a list from the link of one of its files.
+    Add { list: PathBuf, link: String },
 }
 
 fn game(s: &Settings) -> Result<Game> {
@@ -132,11 +116,14 @@ fn clean_game(g: &Game) -> Result<()> {
     Ok(())
 }
 
+const NO_KEY: &str = "Without a Premium Nexus key every mod comes from the host, who must be running `sms host serve` while you sync.";
+
 fn setup(
     game: Option<PathBuf>,
     store: Option<PathBuf>,
     local: Option<PathBuf>,
     documents: Option<PathBuf>,
+    key_stdin: bool,
     interactive: bool,
 ) -> Result<Value> {
     let mut s = Settings::load()?;
@@ -167,7 +154,7 @@ fn setup(
     let store = match store.or(s.store.clone()) {
         Some(p) => p,
         None => config::ask_folder(
-            "Store folder for synced mods (same drive as Skyrim: hardlinks, no copies)?",
+            "Folder for synced mods (same drive as Skyrim: hardlinks, no copies)?",
             interactive,
         )?,
     };
@@ -183,56 +170,68 @@ fn setup(
     s.local = Some(local.unwrap_or(found_local));
     s.documents = Some(documents.unwrap_or(found_docs));
     s.save()?;
-    Ok(json!({"state": "ready", "settings": s}))
+
+    let nexus = match config::nexus_key()? {
+        Some(key) if !key_stdin => Net::new(Some(key))?
+            .nexus_user()
+            .map(|u| u.1)
+            .unwrap_or(false),
+        _ => match config::read_key(key_stdin, interactive)? {
+            Some(key) => {
+                let (_, premium) = Net::new(Some(key.clone()))?.nexus_user()?;
+                config::save_key(&key)?;
+                premium
+            }
+            None => false,
+        },
+    };
+    let note = if nexus {
+        "Nexus mods download from Nexus."
+    } else {
+        NO_KEY
+    };
+    Ok(json!({"state": "ready", "settings": s, "nexus_premium": nexus, "note": note}))
 }
 
-/// The pack a command works on: the code's, else this machine's published one (host), else the synced one.
-enum Which {
-    Code(String),
-    Own,
-    Synced(String),
-}
-fn which(code: Option<String>, st: &Store) -> Result<Which> {
-    if let Some(c) = code {
-        return Ok(Which::Code(c));
-    }
-    if Host::open()?.published()?.is_some() {
-        return Ok(Which::Own);
-    }
-    match st.pack()? {
-        Some(p) => Ok(Which::Synced(p.host)),
-        None => Err(Error::new(
-            "code_required",
-            "Give the host's code: `sms play <code>`.",
-        )),
-    }
-}
-
-/// Syncs a friend's pack; returns it.
-fn do_sync(code: &str, direct: Option<SocketAddr>, g: &Game, st: &Store) -> Result<(Pack, Value)> {
+/// Syncs the given pack, or without one this machine's published pack (host) or the last one.
+fn do_sync(
+    source: Option<String>,
+    direct: Option<SocketAddr>,
+    g: &Game,
+    st: &Store,
+) -> Result<Value> {
     clean_game(g)?;
-    let pack = peer::fetch_pack(code, direct)?;
-    let result = sync::sync(&pack, g, st, &net()?, direct)?;
-    Ok((pack, result))
+    let net = net()?;
+    if source.is_none() {
+        if let Some(own) = Host::open()?.published()? {
+            return sync::sync(&own.pack, g, st, &net, None, Some(&own));
+        }
+    }
+    let remembered = st.root.join("source.txt");
+    let source = match source {
+        Some(s) => s,
+        None => std::fs::read_to_string(&remembered).map_err(|_| {
+            Error::new(
+                "pack_required",
+                "Which pack? `sms play github:OWNER/REPO` (or a link, file or code).",
+            )
+        })?,
+    };
+    let pack = sync::fetch_pack(source.trim(), &net, direct)?;
+    let result = sync::sync(&pack, g, st, &net, direct, None)?;
+    files::write_atomic(&remembered, source.trim().as_bytes())?;
+    if net.key.is_none() {
+        eprintln!("{NO_KEY}");
+    }
+    Ok(result)
 }
 
-/// Loads the synced pack, or the host's own from its own files.
-fn do_load(own: bool, g: &Game, st: &Store) -> Result<Value> {
+fn do_load(g: &Game, st: &Store) -> Result<Value> {
     clean_game(g)?;
-    let mut cache = st.hashes();
-    if own {
-        let published = Host::open()?
-            .published()?
-            .ok_or_else(|| Error::new("not_published", "Publish first."))?;
-        let plan = deploy::plan(&published.pack, g, &mut cache, |e| {
-            published.local.get(&e.hash).cloned()
-        })?;
-        return deploy::load(g, &plan, &published.pack.name);
-    }
     let pack = st
         .pack()?
-        .ok_or_else(|| Error::new("not_synced", "Nothing synced yet: `sms sync <code>`."))?;
-    let plan = deploy::plan(&pack, g, &mut cache, |e| {
+        .ok_or_else(|| Error::new("not_synced", "Nothing synced yet: `sms play <pack>`."))?;
+    let plan = deploy::plan(&pack, g, &mut st.hashes(), |e| {
         st.has(&e.hash, e.size).then(|| st.object(&e.hash))
     })?;
     deploy::load(g, &plan, &pack.name)
@@ -248,13 +247,8 @@ fn status() -> Result<Value> {
             deploy::State::Loaded(name) => json!(name),
         };
         if let Some(p) = st.pack()? {
-            out["synced"] = json!({"pack": p.name, "files": p.files.len(), "plugins": p.plugins.len(), "code": p.host});
-            if g.state() == deploy::State::Clean {
-                let plan = deploy::plan(&p, &g, &mut st.hashes(), |e| {
-                    st.has(&e.hash, e.size).then(|| st.object(&e.hash))
-                })?;
-                out["missing"] = json!(plan.missing.len());
-            }
+            out["synced"] =
+                json!({"pack": p.name, "files": p.files.len(), "plugins": p.plugins.len()});
         }
     }
     Ok(out)
@@ -268,31 +262,26 @@ fn run(cli: Cli) -> Result<Value> {
             store,
             local,
             documents,
-        } => setup(game, store, local, documents, interactive),
-        Command::NexusLogin { stdin } => {
-            let key = config::read_key(stdin, interactive)?;
-            let (name, premium) = Net::new(Some(key.clone()))?.nexus_user()?;
-            config::save_key(&key)?;
-            Ok(
-                json!({"state": "saved", "account": name, "premium": premium,
-                      "note": if premium { "Nexus mods download from Nexus." } else { "Not Premium: Nexus mods come from the host." }}),
-            )
-        }
-        Command::Sync { code, peer_address } => {
+            key_stdin,
+        } => setup(game, store, local, documents, key_stdin, interactive),
+        Command::Play { pack, peer_address } => {
             let s = Settings::load()?;
             let (g, st) = (game(&s)?, store(&s)?);
-            match which(code, &st)? {
-                Which::Code(c) | Which::Synced(c) => Ok(do_sync(&c, peer_address, &g, &st)?.1),
-                Which::Own => {
-                    Ok(json!({"state": "synced", "note": "The host plays from its own files."}))
-                }
-            }
+            launch::refuse_if_running()?;
+            let synced = do_sync(pack, peer_address, &g, &st)?;
+            let loaded = do_load(&g, &st)?;
+            launch::start()?;
+            Ok(
+                json!({"state": "started", "synced": synced, "loaded": loaded, "note": "Run `sms unload` after playing."}),
+            )
+        }
+        Command::Sync { pack, peer_address } => {
+            let s = Settings::load()?;
+            do_sync(pack, peer_address, &game(&s)?, &store(&s)?)
         }
         Command::Load => {
             let s = Settings::load()?;
-            let (g, st) = (game(&s)?, store(&s)?);
-            let own = matches!(which(None, &st)?, Which::Own);
-            do_load(own, &g, &st)
+            do_load(&game(&s)?, &store(&s)?)
         }
         Command::Unload => {
             let g = game(&Settings::load()?)?;
@@ -300,20 +289,6 @@ fn run(cli: Cli) -> Result<Value> {
             deploy::unload(&g)
         }
         Command::Status => status(),
-        Command::Play { code, peer_address } => {
-            let s = Settings::load()?;
-            let (g, st) = (game(&s)?, store(&s)?);
-            launch::refuse_if_running()?;
-            let (own, synced) = match which(code, &st)? {
-                Which::Own => (true, Value::Null),
-                Which::Code(c) | Which::Synced(c) => (false, do_sync(&c, peer_address, &g, &st)?.1),
-            };
-            let loaded = do_load(own, &g, &st)?;
-            launch::start()?;
-            Ok(
-                json!({"state": "started", "synced": synced, "loaded": loaded, "note": "Run `sms unload` after playing."}),
-            )
-        }
         Command::Clean => {
             let freed = store(&Settings::load()?)?.clean()?;
             Ok(json!({"state": "cleaned", "freed_bytes": freed}))
@@ -321,43 +296,14 @@ fn run(cli: Cli) -> Result<Value> {
         Command::Host { command } => {
             let h = Host::open()?;
             match command {
-                HostCommand::Init {
-                    mo2,
-                    profile,
-                    name,
-                    game,
-                } => h.init(Binding {
-                    name: name.unwrap_or_else(|| profile.clone()),
-                    mo2,
-                    profile,
-                    game,
-                    sources: Default::default(),
-                }),
-                HostCommand::Status => h.status(&net()?),
-                HostCommand::Source {
-                    r#mod,
-                    kind,
-                    value,
-                    asset,
-                } => {
-                    let source = match (kind.as_str(), value) {
-                        ("nexus", None) => None,
-                        ("host", None) => Some(Source::Host),
-                        ("url", Some(url)) if url.starts_with("https://") => {
-                            Some(Source::Url { url })
-                        }
-                        ("github", Some(repo)) => Some(Source::Github { repo, asset }),
-                        _ => return Err(Error::new(
-                            "invalid_source",
-                            "Use `nexus`, `host`, `url https://…` or `github OWNER/REPO [ASSET]`.",
-                        )),
-                    };
-                    h.set_source(&r#mod, source)
+                HostCommand::Publish { list, output } => {
+                    let game = config::require(&Settings::load()?.game, "game folder")?;
+                    h.publish(&list, &game, &net()?, output.as_deref())
                 }
-                HostCommand::Publish => h.publish(&net()?),
+                HostCommand::Add { list, link } => h.add(&list, &link, &net()?),
                 HostCommand::Serve { bind } => {
                     let published = h.published()?.ok_or_else(|| {
-                        Error::new("not_published", "Publish first: `sms host publish`.")
+                        Error::new("not_published", "Publish first: `sms host publish <list>`.")
                     })?;
                     let json_mode = cli.json;
                     peer::serve(
@@ -368,7 +314,7 @@ fn run(cli: Cli) -> Result<Value> {
                             if json_mode {
                                 println!("{}", json!({"state": "serving", "code": code}));
                             } else {
-                                println!("Serving. Friends run: sms play {code}\n(Ctrl-C to stop)");
+                                println!("Serving. Friends without a Nexus key run: sms play {code}\n(Ctrl-C to stop)");
                             }
                         },
                         || skyrim_mod_sync::CANCELLED.load(std::sync::atomic::Ordering::Relaxed),

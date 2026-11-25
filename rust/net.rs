@@ -81,6 +81,17 @@ impl Net {
         Ok(done)
     }
 
+    /// A small document (a pack).
+    pub fn get(&self, url: &str) -> Result<Vec<u8>> {
+        Ok(self
+            .client
+            .get(url)
+            .send()?
+            .error_for_status()?
+            .bytes()?
+            .to_vec())
+    }
+
     fn nexus_get(&self, path: &str) -> Result<reqwest::blocking::Response> {
         let key = self
             .key
@@ -104,11 +115,25 @@ impl Net {
             v["is_premium"] == true,
         ))
     }
-    /// A download link for a mod file (Premium accounts).
+    /// A mod's name on Nexus.
+    pub fn nexus_mod_name(&self, game: &str, r#mod: u64) -> Result<String> {
+        let v: Value = self
+            .nexus_get(&format!("/v1/games/{game}/mods/{mod}.json"))?
+            .error_for_status()?
+            .json()?;
+        Ok(v["name"].as_str().unwrap_or("?").to_owned())
+    }
+    /// A download link for a mod file (Premium accounts only).
     pub fn nexus_link(&self, game: &str, r#mod: u64, file: u64) -> Result<String> {
         let r = self.nexus_get(&format!(
             "/v1/games/{game}/mods/{mod}/files/{file}/download_link.json"
         ))?;
+        if r.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::new(
+                "nexus_not_premium",
+                "Downloading through the Nexus API needs a Premium account.",
+            ));
+        }
         let links: Vec<Value> = r.error_for_status()?.json()?;
         links
             .iter()
@@ -119,6 +144,14 @@ impl Net {
                     format!("Nexus gave no link for mod {mod}."),
                 )
             })
+    }
+    /// A mod file's archive name on Nexus (any account).
+    pub fn nexus_file_name(&self, game: &str, r#mod: u64, file: u64) -> Result<String> {
+        let v: Value = self
+            .nexus_get(&format!("/v1/games/{game}/mods/{mod}/files/{file}.json"))?
+            .error_for_status()?
+            .json()?;
+        Ok(v["file_name"].as_str().unwrap_or_default().to_owned())
     }
 
     /// The newest release's (prereleases too) archive whose name contains `asset`, else its only .zip/.7z.

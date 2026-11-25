@@ -1,46 +1,64 @@
 # SkyrimModSync
 
-Play Skyrim with your friends' exact mod setup. The host shares their Mod Organizer 2 profile; friends get
-the same mods with one command, and their own game is restored afterwards.
+Play Skyrim with your friends' exact mod setup. The host writes a mod list; friends get the same mods
+with one command, and their own game is restored afterwards.
 
 ## Install
 
 Download `sms` from the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest)
 (Windows: `sms-windows-x86_64.exe`, Linux: `sms-linux-x86_64`, then `chmod +x` it) and run it from a
-terminal.
-
-## Host
+terminal. First:
 
 ```sh
-sms host init --mo2 "C:\Modding\MO2" --profile "Default"
-sms host publish        # prints your code: send it to your friends
-sms host serve          # keep this running while friends download
+sms setup      # finds Skyrim, asks where to keep mods and for your Nexus API key
 ```
 
-Change mods in MO2 as usual, then publish again (and restart `serve`). To play yourself:
+A Premium Nexus key downloads Nexus mods from Nexus. Without one, mods come from the host, who must be
+running `sms host serve` while you sync.
+
+## Play
 
 ```sh
-sms setup               # once
-sms play
-```
-
-## Friend
-
-```sh
-sms setup               # once: finds Skyrim, asks where to keep the mods
-sms play <code>         # downloads the mods, loads them, starts Skyrim
-sms unload              # after playing: your game is back as it was
+sms play github:OWNER/REPO    # or a pack link, a pack file, or a host's code
+sms unload                    # after playing: your game is back as it was
 ```
 
 Next time, just `sms play`.
 
-Optional: `sms nexus-login` with a Nexus Premium API key downloads Nexus mods from Nexus instead of from
-the host.
+## Host
+
+Write a mod list (`modlist.json`):
+
+```json
+{
+  "name": "Our pack",
+  "mods": [
+    { "name": "SKSE", "nexus": { "mod": 30379, "file": 795992 },
+      "folder": "skse64_2_03_01", "root": ["skse64_loader.exe", "skse64_1_7_104.dll"] },
+    { "name": "USSEP", "nexus": { "mod": 266, "file": 800977 } },
+    { "name": "Our mod", "github": { "repo": "OWNER/REPO" } },
+    { "name": "Tweaks", "local": "tweaks" }
+  ],
+  "plugins": ["unofficial skyrim special edition patch.esp"]
+}
+```
+
+Each mod comes from `nexus`, `url`, `github` (newest release) or `local` (a folder next to the list). Its
+files go into `Data/`; `folder` picks a folder inside the archive, `root` lists files that go next to
+`SkyrimSE.exe`. Later mods win conflicts. `sms host add modlist.json <nexus file link>` adds a Nexus mod.
+
+```sh
+sms host publish modlist.json --output pack.json
+```
+
+Share `pack.json` (attach it to a GitHub release and friends use `github:OWNER/REPO`), or share the code
+it prints and keep `sms host serve` running. Without Nexus Premium, `publish` lists the archives to save by
+hand into `downloads/` next to the list.
 
 ## Good to know
 
-- `sms status` shows what is synced and loaded; `sms clean` frees space from old versions.
-- Mods to share must be installed in MO2; loose files in the game folder are not shared.
+- `sms status` shows what is set up, synced and loaded; `sms clean` frees space from old versions.
+- Everyone needs the same Skyrim version and edition (Anniversary content included or not).
 - Respect mod permissions: share with friends only.
 
 ## Build

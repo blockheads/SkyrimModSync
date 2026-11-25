@@ -8,7 +8,7 @@ pub mod hash;
 pub mod host;
 pub mod ini;
 pub mod launch;
-pub mod mo2;
+pub mod list;
 pub mod net;
 pub mod pack;
 pub mod peer;

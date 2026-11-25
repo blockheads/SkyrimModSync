@@ -72,21 +72,20 @@ pub fn nexus_key() -> Result<Option<String>> {
         .map(|k| k.trim().to_owned())
         .filter(|k| !k.is_empty()))
 }
-/// A key from the terminal (hidden) or one line of stdin.
-pub fn read_key(stdin: bool, interactive: bool) -> Result<String> {
+/// A key from one line of stdin, or asked at a terminal (hidden; Enter skips). None when skipped.
+pub fn read_key(stdin: bool, interactive: bool) -> Result<Option<String>> {
     let key = if stdin {
         let mut key = String::new();
         io::stdin().read_line(&mut key)?;
         key
     } else if interactive && io::stdin().is_terminal() {
-        rpassword::prompt_password("Nexus API key (nexusmods.com > Site preferences > API keys): ")?
+        rpassword::prompt_password(
+            "Nexus API key (Premium; nexusmods.com > Site preferences > API keys; Enter to skip): ",
+        )?
     } else {
-        return Err(Error::new(
-            "setup_required",
-            "Run nexus-login at a terminal, or pass --stdin.",
-        ));
+        return Ok(None);
     };
-    Ok(key.trim().to_owned())
+    Ok(Some(key.trim().to_owned()).filter(|k| !k.is_empty()))
 }
 pub fn save_key(key: &str) -> Result<()> {
     let path = key_path()?;

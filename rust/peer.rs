@@ -20,11 +20,47 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 const ALPN: &[u8] = b"sms/5";
 const STREAMS: usize = 8;
 
-/// What the host serves: its pack and where each of its files is on its disk.
-#[derive(Serialize, Deserialize)]
+/// What the host serves: its pack, its own files (`local`), and for the rest the archive member each
+/// is in, extracted on first request into `extracted` (the host is everyone's fallback).
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Published {
     pub pack: Pack,
     pub local: BTreeMap<String, PathBuf>,
+    pub members: BTreeMap<String, (PathBuf, String)>,
+    pub extracted: PathBuf,
+}
+
+impl Published {
+    /// Where a file's bytes are on this machine (extracting an archive member the first time).
+    pub fn file(&self, hash: &str) -> Result<Option<PathBuf>> {
+        if let Some(p) = self.local.get(hash) {
+            return Ok(Some(p.clone()));
+        }
+        let Some((archive, member)) = self.members.get(hash) else {
+            return Ok(None);
+        };
+        let done = self.extracted.join(hash);
+        if !done.is_file() {
+            std::fs::create_dir_all(&self.extracted)?;
+            let temp = tempfile::NamedTempFile::new_in(&self.extracted)?;
+            crate::archive::extract(archive, &[member.clone()].into(), |_, r| {
+                let mut out = crate::hash::Writer {
+                    inner: temp.as_file(),
+                    hasher: blake3::Hasher::new(),
+                };
+                std::io::copy(r, &mut out)?;
+                if out.hasher.finalize().to_hex().as_str() != hash {
+                    return Err(Error::new(
+                        "archive_changed",
+                        format!("{} no longer holds {member}.", archive.display()),
+                    ));
+                }
+                Ok(())
+            })?;
+            temp.persist(&done).map_err(|e| Error::from(e.error))?;
+        }
+        Ok(Some(done))
+    }
 }
 
 fn failure(e: impl std::fmt::Display) -> Error {
@@ -56,7 +92,7 @@ pub fn secret(path: &Path) -> Result<SecretKey> {
 }
 
 #[derive(Clone, Debug)]
-struct Handler(Arc<(Vec<u8>, BTreeMap<String, PathBuf>)>);
+struct Handler(Arc<(Vec<u8>, Published)>);
 
 impl Handler {
     async fn answer(
@@ -73,15 +109,21 @@ impl Handler {
             words.next().and_then(|o| o.parse::<u64>().ok()),
         ) {
             (Some("pack"), None, None) => send.write_all(&self.0 .0).await.map_err(failure)?,
-            (Some("file"), Some(hash), Some(offset)) => match self.0 .1.get(hash) {
-                Some(path) => {
-                    let mut file = tokio::fs::File::open(path).await?;
-                    file.seek(std::io::SeekFrom::Start(offset)).await?;
-                    send.write_all(b"1").await.map_err(failure)?;
-                    tokio::io::copy(&mut file, &mut send).await?;
+            (Some("file"), Some(hash), Some(offset)) => {
+                let (me, hash) = (self.clone(), hash.to_owned());
+                let path = tokio::task::spawn_blocking(move || me.0 .1.file(&hash))
+                    .await
+                    .map_err(failure)??;
+                match path {
+                    Some(path) => {
+                        let mut file = tokio::fs::File::open(path).await?;
+                        file.seek(std::io::SeekFrom::Start(offset)).await?;
+                        send.write_all(b"1").await.map_err(failure)?;
+                        tokio::io::copy(&mut file, &mut send).await?;
+                    }
+                    None => send.write_all(b"0").await.map_err(failure)?,
                 }
-                None => send.write_all(b"0").await.map_err(failure)?,
-            },
+            }
             _ => return Err(Error::new("bad_request", "Unknown request.")),
         }
         send.finish().map_err(failure)?;
@@ -119,7 +161,7 @@ pub fn serve(
         let endpoint = builder.bind().await.map_err(failure)?;
         let id = endpoint.id().to_string();
         let router = Router::builder(endpoint)
-            .accept(ALPN, Handler(Arc::new((pack, published.local))))
+            .accept(ALPN, Handler(Arc::new((pack, published))))
             .spawn();
         ready(&id);
         while !stop() {
