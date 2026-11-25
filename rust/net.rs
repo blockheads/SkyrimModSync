@@ -154,6 +154,24 @@ impl Net {
         Ok(v["file_name"].as_str().unwrap_or_default().to_owned())
     }
 
+    /// A file of a gist, its newest version.
+    pub fn gist_file(&self, id: &str, name: &str) -> Result<Vec<u8>> {
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(Error::new("invalid_source", "Expected gist:<id>."));
+        }
+        let gist: Value = self
+            .client
+            .get(format!("{}/gists/{id}", self.github))
+            .header("Accept", "application/vnd.github+json")
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let url = gist["files"][name]["raw_url"]
+            .as_str()
+            .ok_or_else(|| Error::new("no_asset", format!("The gist has no {name}.")))?;
+        self.get(url)
+    }
+
     /// The newest release's (prereleases too) archive whose name contains `asset`, else its only .zip/.7z.
     pub fn github_asset(&self, repo: &str, asset: Option<&str>) -> Result<String> {
         let releases: Vec<Value> = self

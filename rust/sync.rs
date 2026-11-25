@@ -22,7 +22,9 @@ const DOWNLOADS: usize = 3;
 
 /// Fetches a pack from wherever `source` names.
 pub fn fetch_pack(source: &str, net: &Net, direct: Option<SocketAddr>) -> Result<Pack> {
-    let bytes = if let Some(repo) = source.strip_prefix("github:") {
+    let bytes = if let Some(id) = source.strip_prefix("gist:") {
+        net.gist_file(id, "pack.json")?
+    } else if let Some(repo) = source.strip_prefix("github:") {
         net.get(&net.github_asset(repo, Some("pack.json"))?)?
     } else if source.starts_with("https://") || source.starts_with("http://") {
         net.get(source)?

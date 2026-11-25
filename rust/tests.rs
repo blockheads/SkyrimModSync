@@ -100,6 +100,11 @@ fn fake_api(pack: Arc<Mutex<Vec<u8>>>) -> String {
                     "/dl/A.zip" => ("200 OK", a.clone()),
                     "/dl/skse.zip" => ("200 OK", skse.clone()),
                     "/dl/pack.json" => ("200 OK", pack.lock().unwrap().clone()),
+                    "/gists/abc123" => (
+                        "200 OK",
+                        format!(r#"{{"files":{{"pack.json":{{"raw_url":"{b}/dl/pack.json"}}}}}}"#)
+                            .into_bytes(),
+                    ),
                     _ => ("404 Not Found", b"{}".to_vec()),
                 };
             let _ = write!(
@@ -364,7 +369,7 @@ fn a_pack_without_host_files_needs_no_host() {
         .replace(r#", "B.esp""#, "");
     write(&w.root, "list/modlist.json", list.as_bytes());
     w.publish();
-    let synced = w.sync("github:fake/pack", Some("friend"), None);
+    let synced = w.sync("gist:abc123", Some("friend"), None);
     assert_eq!(synced["host_files"], 0);
     w.load();
     assert_eq!(w.read("Data/A.esp"), b"a-plugin");

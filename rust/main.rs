@@ -23,8 +23,8 @@ struct Cli {
     command: Command,
 }
 
-/// A pack: `github:OWNER/REPO` (its newest release's pack.json), a pack URL or file, or a host's code.
-const PACK: &str = "github:OWNER/REPO, a pack URL or file, or a host's code";
+/// A pack: `gist:ID` or `github:OWNER/REPO` (their newest pack.json), a pack URL or file, or a host's code.
+const PACK: &str = "gist:ID, github:OWNER/REPO, a pack URL or file, or a host's code";
 
 #[derive(Subcommand)]
 enum Command {
