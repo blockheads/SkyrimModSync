@@ -27,6 +27,31 @@ pub fn protected(path: &str) -> bool {
         || name == "data/_resourcepack.bsa"
 }
 
+/// Game executables and the launcher slot: no pack source may name one (except SkyrimSE.exe as base).
+/// Covers saved copies such as SkyrimSE_1.6.1170.exe.
+pub fn executable(path: &str) -> bool {
+    let n = fold(path);
+    !n.contains('/') && n.starts_with("skyrimse") && n.contains(".exe")
+}
+
+/// What a game folder itself may contribute: the licensed files (matched, never sent) and SKSE's own
+/// root files. Anything else there may be Bethesda's or private; it must be an MO2 mod to be shared.
+pub fn from_game_folder(path: &str) -> bool {
+    let n = fold(path);
+    protected(path)
+        || !n.contains('/')
+            && n.starts_with("skse64_")
+            && (n.ends_with(".dll") || n.ends_with(".exe"))
+}
+
+/// Data/ files that ship with the game or are its output: load leaves them where they are.
+pub fn stays(path: &str) -> bool {
+    let n = fold(path);
+    n == "data/marketplacetextures.bsa"
+        || n.starts_with("data/video/")
+        || n.starts_with("data/skse/plugins/logs/")
+}
+
 /// Lines of a small text file, without comments, blanks or a BOM.
 pub fn lines(path: Option<&Path>) -> Result<Vec<String>> {
     let Some(path) = path else { return Ok(vec![]) };
@@ -87,6 +112,11 @@ pub fn ignored(name: &str, logs: &BTreeSet<String>) -> bool {
         || n.starts_with("saves/")
         || n.starts_with(".skyrim-mod-sync/")
         || (n.starts_with("logs/") && (n.ends_with(".log") || n.ends_with(".dmp")))
+        || n.starts_with("data/skse/plugins/logs/")
+        || n.starts_with("data/logs/")
+        || n.ends_with(".log")
+        || n.ends_with(".dmp")
+        || n.ends_with(".pdb")
         || n.ends_with(".ess")
         || n.ends_with(".skse")
         || n.ends_with(".mohidden")
@@ -131,5 +161,22 @@ mod tests {
         assert!(ignored("Saves/a.ess", &logs));
         assert!(ignored(".skyrim-mod-sync/journal", &logs));
         assert!(!ignored("Data/SKSE/Plugins/BugFixesSSE.dll", &logs));
+        assert!(ignored("Data/SKSE/Plugins/logs/tp_client.1.log", &logs));
+        assert!(ignored("Data/SKSE/Plugins/logs/tp_client.log.1", &logs));
+    }
+    #[test]
+    fn a_game_folder_gives_only_licensed_matches_and_skse() {
+        assert!(from_game_folder("skse64_1_7_104.dll") && from_game_folder("skse64_loader.exe"));
+        assert!(from_game_folder("Data/Skyrim.esm"));
+        for p in [
+            "SkyrimSE_1.7.104.exe",
+            "SkyrimSELauncher.exe",
+            "Data/Video/BGS_Logo.bik",
+            "Data/Mine.esp",
+            "notes.txt",
+        ] {
+            assert!(!from_game_folder(p), "{p}");
+        }
+        assert!(executable("SkyrimSE_1.7.104.exe") && executable("SkyrimSELauncher.exe"));
     }
 }

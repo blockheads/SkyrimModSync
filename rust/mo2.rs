@@ -31,6 +31,8 @@ pub struct Winner {
 #[derive(Debug)]
 pub struct Profile {
     pub game: PathBuf,
+    /// Files in the game folder itself that a pack never carries.
+    pub unshared: usize,
     /// Folded path -> winner.
     pub files: BTreeMap<String, Winner>,
     /// Enabled mods, lowest priority first.
@@ -239,6 +241,9 @@ pub fn read(
 
     let mut winners = BTreeMap::new();
     add(&mut winners, &game, None)?;
+    let found = winners.len();
+    winners.retain(|_, w| snapshot::from_game_folder(&w.path));
+    let unshared = found - winners.len();
     let list = snapshot::lines(Some(&files::require(&selected, "modlist.txt")?))?;
     let mut seen = BTreeSet::new();
     let mut mods = vec![];
@@ -261,7 +266,10 @@ pub fn read(
     let overwrite = folder(&instance, &s, "overwrite_directory", "overwrite")?;
     add(&mut winners, &overwrite, Some("Overwrite"))?;
     let logs = snapshot::known_logs(winners.values().map(|w| w.path.clone()));
-    winners.retain(|_, w| !snapshot::ignored(&w.path, &logs));
+    winners.retain(|_, w| {
+        !snapshot::ignored(&w.path, &logs)
+            && (!snapshot::executable(&w.path) || snapshot::protected(&w.path))
+    });
 
     let plugins = snapshot::lines(files::locate(&selected, "plugins.txt")?.as_deref())?;
     let loadorder = snapshot::lines(files::locate(&selected, "loadorder.txt")?.as_deref())?;
@@ -273,6 +281,7 @@ pub fn read(
     }
     Ok(Profile {
         game,
+        unshared,
         files: winners,
         mods,
         plugins,

@@ -27,8 +27,9 @@ its own MO2 files (hardlinked, nothing downloaded), loads it and starts Skyrim. 
 
 ## What a pack is
 
-The host's installed files (what the profile deploys: the game folder, enabled mods by priority,
-MO2's overwrite folder, mods' `Root/` files), the load order (`plugins.txt`, `loadorder.txt`) and the
+The host's installed files (enabled mods by priority, MO2's overwrite folder, mods' `Root/`
+files; from the game folder itself only SKSE's root files, so other hand-installed mods must be MO2 mods; logs and
+saves never), the load order (`plugins.txt`, `loadorder.txt`) and the
 shared INI settings (screen and controls stay personal). Each file is pinned by SHA-256 and says
 where its bytes come from:
 

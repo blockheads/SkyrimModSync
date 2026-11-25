@@ -102,6 +102,14 @@ impl Pack {
             if !files::digest_valid(&e.sha256) || !paths.insert(files::fold(&e.path)) {
                 return bad(format!("Invalid or duplicate file {}.", e.path));
             }
+            // A pack may not write over our journal, the launcher slot, saves or the game's executable.
+            let licensed = snapshot::protected(&e.path);
+            if snapshot::ignored(&e.path, &BTreeSet::new())
+                || snapshot::executable(&e.path) && !licensed
+                || licensed && e.source != Source::Base
+            {
+                return bad(format!("A pack cannot provide {}.", e.path));
+            }
             match &e.source {
                 Source::Base if !snapshot::protected(&e.path) => {
                     return bad(format!(
@@ -218,6 +226,22 @@ mod tests {
             blob: iroh_blobs::Hash::new(b"x").to_string(),
         };
         assert_eq!(p.validate().unwrap_err().code, "invalid_pack");
+    }
+    #[test]
+    fn a_pack_cannot_touch_the_journal_executables_or_licensed_files() {
+        for path in [
+            ".skyrim-mod-sync/journal.jsonl",
+            "SkyrimSE.exe",
+            "SkyrimSE_1.7.104.exe",
+            "skyrimselauncher.EXE",
+            "Data/Skyrim.esm",
+            "Saves/a.ess",
+        ] {
+            let mut p = sample();
+            p.files.remove(1);
+            p.files[0].path = path.into();
+            assert!(p.validate().is_err(), "{path}");
+        }
     }
     #[test]
     fn mod_files_never_claim_to_be_base_game() {

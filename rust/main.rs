@@ -223,7 +223,10 @@ fn status() -> Result<Value> {
 fn do_sync(code: Option<&str>, peer_address: Option<SocketAddr>) -> Result<Option<Value>> {
     let s = Settings::load()?;
     let (g, st) = (game(&s)?, store(&s)?);
-    deploy::recover(&g)?;
+    if g.state()? == deploy::State::Interrupted {
+        launch::refuse_if_running()?;
+        deploy::recover(&g)?;
+    }
     let (pack, head, local) = match code {
         Some(code) => {
             let (pack, head) = sync::resolve(code, &st, peer_address)?;

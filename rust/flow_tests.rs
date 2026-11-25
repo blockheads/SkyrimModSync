@@ -107,6 +107,17 @@ fn host_publishes_friend_syncs_loads_and_unloads_cleanly() {
     std::env::set_var("SMS_ALLOW_HTTP", "1");
     mo2::fixture::instance(root);
     write(root, "game/skse64_loader.exe", b"loader");
+    // Loose in the game folder or logged by a past session: never shared.
+    let private = [
+        "game/SkyrimSE_1.7.104.exe",
+        "game/Data/Video/logo.bik",
+        "game/Data/HandInstalled.esp",
+        "game/Data/SKSE/Plugins/logs/tp_client.log",
+        "mo2/overwrite/SKSE/Plugins/logs/tp_client.1.log",
+    ];
+    for p in private {
+        write(root, p, b"private");
+    }
     let mut zip = vec![];
     fs::File::open(root.join("mo2/downloads/A-100-1-0.zip"))
         .unwrap()
@@ -150,6 +161,9 @@ fn host_publishes_friend_syncs_loads_and_unloads_cleanly() {
         .files
         .iter()
         .all(|e| !e.path.eq_ignore_ascii_case("SkyrimSELauncher.exe")));
+    let secret = crate::files::hash_bytes(b"private");
+    assert!(draft.pack.files.iter().all(|e| e.sha256 != secret));
+    assert!(draft.local.keys().all(|sha| *sha != secret));
     let status = host.status().unwrap();
     let mods = status["mods"].as_array().unwrap();
     assert_eq!(

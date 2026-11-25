@@ -78,6 +78,8 @@ pub struct Draft {
     /// Every non-base file by SHA-256 -> where it is on the host (the host plays from these).
     pub local: BTreeMap<String, PathBuf>,
     pub mods: Vec<ModReport>,
+    /// Loose game-folder files left out.
+    pub unshared: usize,
 }
 
 impl Host {
@@ -295,10 +297,6 @@ impl Host {
         let mut used = BTreeMap::new();
         let mut reports: BTreeMap<String, ModReport> = BTreeMap::new();
         for w in profile.files.values() {
-            let base = fold(&w.path);
-            if base == "skyrimselauncher.exe" || base == "skyrimselauncher.bethesda.exe" {
-                continue; // `sms load` puts SKSE's loader there
-            }
             let (size, sha256) = cache.sha256(&w.file)?;
             let source = if snapshot::protected(&w.path) {
                 Source::Base
@@ -396,6 +394,7 @@ impl Host {
             host_files,
             local,
             mods,
+            unshared: profile.unshared,
         })
     }
 
@@ -439,6 +438,7 @@ impl Host {
             "archives": d.pack.archives.len(),
             "bytes": total,
             "host_bytes": host,
+            "game_folder_files_not_shared": d.unshared,
             "mods": d.mods,
         }))
     }

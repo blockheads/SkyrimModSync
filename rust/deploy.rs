@@ -290,7 +290,11 @@ fn write_user(
     if original {
         let b = game.dir().join("backup").join(&backup);
         fs::create_dir_all(b.parent().unwrap())?;
-        fs::copy(&file, &b)?;
+        // Whole or absent: a crash mid-copy must not leave a torn backup to restore.
+        let part = b.with_extension("part");
+        fs::copy(&file, &part)?;
+        File::open(&part)?.sync_all()?;
+        fs::rename(&part, &b)?;
     }
     let mut out = File::create(&file)?;
     out.write_all(text.as_bytes())?;
@@ -378,7 +382,7 @@ pub fn load(game: &Game, store: &Store, pack: &Pack, sequence: u64) -> Result<Va
         let data_name = data.file_name().unwrap().to_string_lossy().into_owned();
         for rel in found {
             let path = format!("{data_name}/{rel}");
-            if !wanted.contains(&fold(&path)) {
+            if !wanted.contains(&fold(&path)) && !snapshot::stays(&path) {
                 journal.write(&Op::Aside { path: path.clone() })?;
                 move_file(&game.root.join(&path), &game.backup(&path))?;
                 set_aside += 1;
