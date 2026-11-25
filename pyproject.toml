@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skyrim-mod-sync"
+version = "0.1.0"
+description = "Share and reproduce isolated Skyrim setups with verified file manifests"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+dependencies = ["xxhash>=3.5,<4", "pefile==2024.8.26"]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.8,<7"]
+dev = ["pytest>=8,<10"]
+bundle = ["pyinstaller>=6,<7"]
+
+[project.scripts]
+skyrim-mod-sync = "skyrim_mod_sync.cli:main"
+skyrim-mod-sync-gui = "skyrim_mod_sync.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
