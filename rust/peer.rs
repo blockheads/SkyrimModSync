@@ -228,14 +228,15 @@ async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Res
             format!("The host no longer has {hash}: ask them to publish again."),
         ));
     }
+    // Written from where the part ends (not append mode: Windows will not truncate through it).
     let mut out = tokio::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(false)
         .open(&part)
         .await?;
-    if have == 0 {
-        out.set_len(0).await?;
-    }
+    out.set_len(have).await?;
+    out.seek(std::io::SeekFrom::Start(have)).await?;
     let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = recv.read(&mut buf).await.map_err(failure)?.unwrap_or(0);
