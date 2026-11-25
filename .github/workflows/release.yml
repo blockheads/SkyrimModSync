@@ -1,6 +1,8 @@
 name: Release
 on:
   push:
+    # main builds without publishing: tags can only reuse caches made there.
+    branches: [main]
     tags: ['v*']
 permissions:
   contents: write
@@ -9,7 +11,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, name: sms-linux-x86_64 }
+          # 22.04: an old glibc, so the binary starts on older distributions too.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: sms-linux-x86_64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: sms-windows-x86_64.exe }
     runs-on: ${{ matrix.os }}
     steps:
@@ -17,18 +20,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - shell: bash
         run: |
           src="target/${{ matrix.target }}/release/sms"
           [[ "${{ matrix.target }}" == *windows* ]] && src="$src.exe"
           cp "$src" "${{ matrix.name }}"
+          "./${{ matrix.name }}" --version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
