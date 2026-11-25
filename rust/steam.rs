@@ -253,7 +253,7 @@ mod tests {
             steam.join("steamapps/libraryfolders.vdf"),
             format!(
                 "\"libraryfolders\" {{ \"0\" {{ \"path\" \"{}\" }} }}",
-                lib.display()
+                lib.display().to_string().replace('\\', "\\\\")
             ),
         )
         .unwrap();
