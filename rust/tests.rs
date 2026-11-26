@@ -70,43 +70,66 @@ fn fake_api(pack: Arc<Mutex<Vec<u8>>>) -> String {
             let mut reader = BufReader::new(s.try_clone().unwrap());
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
-            let (mut line, mut free) = (String::new(), false);
+            let (mut line, mut free, mut token, mut length) = (String::new(), false, false, 0);
             while reader.read_line(&mut line).unwrap() > 2 {
-                free |= line.to_lowercase().starts_with("apikey: free");
+                let lower = line.to_lowercase();
+                free |= lower.starts_with("apikey: free");
+                token |= lower.starts_with("authorization: bearer gh-token");
+                if let Some(n) = lower.strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap();
+                }
                 line.clear();
             }
+            let mut body = vec![0; length];
+            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+            let method = first.split_whitespace().next().unwrap_or("").to_owned();
+            // A gist save: its pack.json becomes what /gists/abc123 serves.
+            let save = || {
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(v["public"], false);
+                *pack.lock().unwrap() = v["files"]["pack.json"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
+                ("200 OK", br#"{"id":"abc123"}"#.to_vec())
+            };
             let release = |name: &str| {
                 format!(r#"[{{"draft":false,"assets":[{{"name":"notes.txt"}},{{"name":"{name}","browser_download_url":"{b}/dl/{name}"}}]}}]"#).into_bytes()
             };
-            let (status, body): (&str, Vec<u8>) =
-                match first.split_whitespace().nth(1).unwrap_or("") {
-                    "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json"
-                        if free =>
-                    {
-                        ("403 Forbidden", b"{}".to_vec())
-                    }
-                    "/v1/games/skyrimspecialedition/mods/100/files/200.json" => {
-                        ("200 OK", br#"{"file_name":"A-100-1-0.zip"}"#.to_vec())
-                    }
-                    "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json" => (
-                        "200 OK",
-                        format!(r#"[{{"URI":"{b}/dl/A.zip"}}]"#).into_bytes(),
-                    ),
-                    "/v1/games/skyrimspecialedition/mods/100.json" => {
-                        ("200 OK", br#"{"name":"Mod A"}"#.to_vec())
-                    }
-                    "/repos/fake/skse/releases?per_page=10" => ("200 OK", release("skse.zip")),
-                    "/repos/fake/pack/releases?per_page=10" => ("200 OK", release("pack.json")),
-                    "/dl/A.zip" => ("200 OK", a.clone()),
-                    "/dl/skse.zip" => ("200 OK", skse.clone()),
-                    "/dl/pack.json" => ("200 OK", pack.lock().unwrap().clone()),
-                    "/gists/abc123" => (
-                        "200 OK",
-                        format!(r#"{{"files":{{"pack.json":{{"raw_url":"{b}/dl/pack.json"}}}}}}"#)
-                            .into_bytes(),
-                    ),
-                    _ => ("404 Not Found", b"{}".to_vec()),
-                };
+            let path = first.split_whitespace().nth(1).unwrap_or("");
+            let (status, body): (&str, Vec<u8>) = match path {
+                "/gists" | "/gists/abc123" if method != "GET" && !token => {
+                    ("401 Unauthorized", b"{}".to_vec())
+                }
+                "/gists" if method == "POST" => save(),
+                "/gists/abc123" if method == "PATCH" => save(),
+                "/gists/gone" if method == "PATCH" => ("404 Not Found", b"{}".to_vec()),
+                "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json" if free => {
+                    ("403 Forbidden", b"{}".to_vec())
+                }
+                "/v1/games/skyrimspecialedition/mods/100/files/200.json" => {
+                    ("200 OK", br#"{"file_name":"A-100-1-0.zip"}"#.to_vec())
+                }
+                "/v1/games/skyrimspecialedition/mods/100/files/200/download_link.json" => (
+                    "200 OK",
+                    format!(r#"[{{"URI":"{b}/dl/A.zip"}}]"#).into_bytes(),
+                ),
+                "/v1/games/skyrimspecialedition/mods/100.json" => {
+                    ("200 OK", br#"{"name":"Mod A"}"#.to_vec())
+                }
+                "/repos/fake/skse/releases?per_page=10" => ("200 OK", release("skse.zip")),
+                "/repos/fake/pack/releases?per_page=10" => ("200 OK", release("pack.json")),
+                "/dl/A.zip" => ("200 OK", a.clone()),
+                "/dl/skse.zip" => ("200 OK", skse.clone()),
+                "/dl/pack.json" => ("200 OK", pack.lock().unwrap().clone()),
+                "/gists/abc123" => (
+                    "200 OK",
+                    format!(r#"{{"files":{{"pack.json":{{"raw_url":"{b}/dl/pack.json"}}}}}}"#)
+                        .into_bytes(),
+                ),
+                _ => ("404 Not Found", b"{}".to_vec()),
+            };
             let _ = write!(
                 s,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -548,4 +571,50 @@ fn clean_keeps_only_what_the_pack_uses() {
         .iter()
         .filter(|e| e.from != From::Base)
         .all(|e| st.has(&e.hash, e.size)));
+}
+
+#[test]
+fn a_pasted_code_or_gist_link_is_a_gist() {
+    let id = "eb7eca10402bc5788401577d47262f3d";
+    for input in [
+        id.to_owned(),
+        format!(" {id}\n"),
+        format!("https://gist.github.com/someone/{id}"),
+        format!("gist:{id}"),
+    ] {
+        assert_eq!(sync::source(&input), format!("gist:{id}"));
+    }
+    assert_eq!(sync::source("github:a/b"), "github:a/b");
+    assert_eq!(sync::source("abc"), "abc");
+}
+
+#[test]
+fn the_host_shares_its_pack_in_a_secret_gist() {
+    let w = world();
+    w.publish();
+    let pack = serde_json::to_string(&w.host.published().unwrap().unwrap().pack).unwrap();
+    *w.pack.lock().unwrap() = vec![];
+    let net = w.net(Some("host"));
+    let files = [("pack.json", pack.clone())];
+    let refused = net.gist_save("wrong", None, "Test", &files).unwrap_err();
+    assert_eq!(refused.code, "github_token");
+    assert_eq!(
+        net.gist_save("gh-token", None, "Test", &files).unwrap(),
+        "abc123"
+    );
+    assert_eq!(*w.pack.lock().unwrap(), pack.as_bytes());
+    assert_eq!(
+        net.gist_save("gh-token", Some("abc123"), "Test", &files)
+            .unwrap(),
+        "abc123"
+    );
+    let gone = net
+        .gist_save("gh-token", Some("gone"), "Test", &files)
+        .unwrap_err();
+    assert_eq!(gone.code, "gist_missing");
+    let (addr, stop) = w.serve();
+    w.sync("gist:abc123", Some("friend"), Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    w.load();
+    assert_eq!(w.read("Data/A.esp"), b"a-plugin");
 }

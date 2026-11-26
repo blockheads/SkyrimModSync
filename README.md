@@ -1,33 +1,26 @@
 # SkyrimModSync
 
-Play Skyrim with your friends' exact mod setup. The host writes a mod list; friends get the same mods
-with one command, and their own game is restored afterwards.
-
-## Install
-
-Download `sms` from the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest)
-(Windows: `sms-windows-x86_64.exe`, Linux: `sms-linux-x86_64`, then `chmod +x` it) and run it from a
-terminal. First:
-
-```sh
-sms setup      # finds Skyrim, asks where to keep mods and for your Nexus API key
-```
-
-A Premium Nexus key downloads Nexus mods from Nexus. Without one, mods come from the host, who must be
-running `sms host serve` while you sync.
+Play Skyrim with your friends' exact mod setup. The host shares a pack code; friends paste it, play, and
+turn it off afterwards to get their own game back.
 
 ## Play
 
-```sh
-sms play gist:ID              # or github:OWNER/REPO, a pack link or file, or a host's code
-sms unload                    # after playing: your game is back as it was
-```
+1. Download `sms` from the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest)
+   (Windows: `sms-windows-x86_64.exe`; Linux: `sms-linux-x86_64`, then `chmod +x` it) and put it in your
+   Skyrim folder (the one with `SkyrimSE.exe`).
+2. Run it (double-click on Windows). The first time it asks where to keep mods and for your Nexus API key
+   (Enter skips it), then for the pack code your host gave you.
+3. Start Skyrim from Steam.
 
-Next time, just `sms play`.
+When you're done: `sms disable` puts your game back as it was; `sms enable` turns the pack on again. Run
+`sms` again to get the host's newest pack (Enter reuses the last code).
+
+A Premium Nexus key downloads Nexus mods from Nexus; without one, mods come from the host, who must have
+`sms host` running while you sync.
 
 ## Host
 
-Write a mod list (`modlist.json`):
+Write a mod list, `modlist.json`:
 
 ```json
 {
@@ -47,25 +40,21 @@ Each mod comes from `nexus`, `url`, `github` (newest release) or `local` (a fold
 files go into `Data/`; `folder` picks a folder inside the archive, `root` lists files that go next to
 `SkyrimSE.exe`. Later mods win conflicts. `sms host add modlist.json <nexus file link>` adds a Nexus mod.
 
-```sh
-sms host publish modlist.json --output pack.json
-```
-
-Share `pack.json`. A gist is the lightest way:
+Then, in the list's folder:
 
 ```sh
-gh gist create modlist.json pack.json      # once (secret by default); friends run `sms play gist:<id>`
-# after publishing again:
-jq -n --rawfile c pack.json '{files: {"pack.json": {content: $c}}}' | gh api -X PATCH gists/<id> --input -
+sms host
 ```
 
-Or attach it to a GitHub release (`github:OWNER/REPO`), or share the code `publish` prints and keep
-`sms host serve` running. Without Nexus Premium, `publish` lists the archives to save by
-hand into `downloads/` next to the list.
+It builds the pack, uploads it to a secret gist (using your `gh` login, or asking once for a GitHub token
+with the gist scope), turns the pack on in your own game, prints the pack code and sends friends the files
+Nexus can't, until Ctrl-C. The code stays the same when you change the list and run it again.
+
+Without Nexus Premium, `sms host` lists the archives to save by hand into `downloads/` next to the list.
 
 ## Good to know
 
-- `sms status` shows what is set up, synced and loaded; `sms clean` frees space from old versions.
+- `sms status` shows what is set up and enabled; `sms clean` frees space from old versions.
 - Everyone needs the same Skyrim version and edition (Anniversary content included or not).
 - Respect mod permissions: share with friends only.
 

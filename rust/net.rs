@@ -172,6 +172,47 @@ impl Net {
         self.get(url)
     }
 
+    /// Saves files to a secret gist: a new one (`id` None) or a new version of `id`; returns its id.
+    pub fn gist_save(
+        &self,
+        token: &str,
+        id: Option<&str>,
+        description: &str,
+        files: &[(&str, String)],
+    ) -> Result<String> {
+        let files: serde_json::Map<String, Value> = files
+            .iter()
+            .map(|(n, c)| (n.to_string(), serde_json::json!({ "content": c })))
+            .collect();
+        let body = serde_json::json!({"description": description, "public": false, "files": files});
+        let request = match id {
+            Some(id) => self.client.patch(format!("{}/gists/{id}", self.github)),
+            None => self.client.post(format!("{}/gists", self.github)),
+        };
+        let r = request
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&body)
+            .send()?;
+        match r.status().as_u16() {
+            401 | 403 => {
+                return Err(Error::new(
+                    "github_token",
+                    "GitHub refused the token: it needs the gist scope.",
+                ))
+            }
+            404 if id.is_some() => {
+                return Err(Error::new("gist_missing", "The pack's gist is gone."))
+            }
+            _ => {}
+        }
+        let v: Value = r.error_for_status()?.json()?;
+        v["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| Error::new("github_error", "GitHub returned no gist id."))
+    }
+
     /// The newest release's (prereleases too) archive whose name contains `asset`, else its only .zip/.7z.
     pub fn github_asset(&self, repo: &str, asset: Option<&str>) -> Result<String> {
         let releases: Vec<Value> = self

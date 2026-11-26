@@ -1,6 +1,6 @@
-//! Starting the game through Steam: with a pack loaded, Steam's launcher slot holds SKSE's loader, so
+//! Whether Skyrim is running. With a pack enabled, Steam's launcher slot holds SKSE's loader, so Play in
 //! Steam (and on Linux its Proton setup) starts Skyrim with SKSE.
-use crate::{steam, Error, Result};
+use crate::{Error, Result};
 use std::process::Command;
 
 /// Whether a Skyrim process is running (load/unload must not touch a running game).
@@ -42,29 +42,6 @@ pub fn refuse_if_running() -> Result<()> {
         return Err(Error::new(
             "game_running",
             "Skyrim is running: quit it first.",
-        ));
-    }
-    Ok(())
-}
-
-/// Asks Steam to start Skyrim.
-pub fn start() -> Result<()> {
-    let url = format!("steam://run/{}", steam::APP_ID);
-    let started = if cfg!(windows) {
-        Command::new("cmd")
-            .args(["/C", "start", "", &url])
-            .spawn()
-            .is_ok()
-    } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(&url).spawn().is_ok()
-    } else {
-        Command::new("steam").arg(&url).spawn().is_ok()
-            || Command::new("xdg-open").arg(&url).spawn().is_ok()
-    };
-    if !started {
-        return Err(Error::new(
-            "steam_unavailable",
-            "Couldn't ask Steam to start Skyrim: is Steam installed and running?",
         ));
     }
     Ok(())

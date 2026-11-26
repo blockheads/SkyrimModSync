@@ -20,8 +20,24 @@ use std::{
 
 const DOWNLOADS: usize = 3;
 
+/// What a player pastes, as a source: a bare gist id or gist link becomes `gist:ID`.
+pub fn source(input: &str) -> String {
+    let s = input.trim();
+    let id = s
+        .strip_prefix("https://gist.github.com/")
+        .map(|rest| rest.trim_end_matches('/').rsplit('/').next().unwrap_or(""))
+        .unwrap_or(s);
+    let hex = |t: &str| matches!(t.len(), 20 | 32) && t.chars().all(|c| c.is_ascii_hexdigit());
+    if hex(id) {
+        format!("gist:{id}")
+    } else {
+        s.to_owned()
+    }
+}
+
 /// Fetches a pack from wherever `source` names.
 pub fn fetch_pack(source: &str, net: &Net, direct: Option<SocketAddr>) -> Result<Pack> {
+    let source = &self::source(source);
     let bytes = if let Some(id) = source.strip_prefix("gist:") {
         net.gist_file(id, "pack.json")?
     } else if let Some(repo) = source.strip_prefix("github:") {
@@ -114,7 +130,7 @@ pub fn sync(
     if !wanted.is_empty() {
         crate::event(
             "from_host",
-            json!({"files": wanted.len(), "note": "the host must be running `sms host serve`"}),
+            json!({"files": wanted.len(), "note": "the host needs `sms host` running"}),
         );
     }
     peer::fetch_files(&pack.host, direct, store, &wanted)?;

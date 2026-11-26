@@ -66,7 +66,7 @@ impl Published {
 fn failure(e: impl std::fmt::Display) -> Error {
     Error::new(
         "peer_unavailable",
-        format!("Couldn't reach the host ({e}). The host must run `sms host serve`."),
+        format!("Couldn't reach the host ({e}). The host must have `sms host` running."),
     )
 }
 fn runtime() -> Result<tokio::runtime::Runtime> {

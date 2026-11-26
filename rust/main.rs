@@ -11,24 +11,32 @@ use skyrim_mod_sync::{
     store::Store,
     sync, Error, Result,
 };
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{
+    io::{self, IsTerminal},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 #[derive(Parser)]
-#[command(version, about = "Play Skyrim with your friends' exact mod setup")]
+#[command(
+    version,
+    about = "Play Skyrim with your friends' exact mod setup. Run without a command: set up, paste a pack code, play."
+)]
 struct Cli {
     /// Machine-readable output: one JSON result on stdout, progress on stderr; never prompts.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
-/// A pack: `gist:ID` or `github:OWNER/REPO` (their newest pack.json), a pack URL or file, or a host's code.
-const PACK: &str = "gist:ID, github:OWNER/REPO, a pack URL or file, or a host's code";
+const PACK: &str =
+    "A pack code (gist id or link), github:OWNER/REPO, a pack URL or file, or a host's code";
 
 #[derive(Subcommand)]
 enum Command {
-    /// Find Skyrim, choose where synced mods live, and give your Nexus API key.
+    /// Choose the game, the folder for mods and your Nexus API key (the first run asks by itself).
     Setup {
         #[arg(long)]
         game: Option<PathBuf>,
@@ -44,51 +52,42 @@ enum Command {
         #[arg(long)]
         key_stdin: bool,
     },
-    /// Sync, load and start Skyrim through Steam. Without a pack: your last one (the host: its own).
-    Play {
+    /// Sync a pack and put it in the game; then start Skyrim from Steam. Without a code: the last one.
+    Enable {
         #[arg(help = PACK)]
-        pack: Option<String>,
+        code: Option<String>,
         /// Reach the host at this address directly (local tests).
-        #[arg(long)]
+        #[arg(long, hide = true)]
         peer_address: Option<SocketAddr>,
     },
-    /// Fetch a pack's files into the store without loading.
-    Sync {
-        #[arg(help = PACK)]
-        pack: Option<String>,
-        #[arg(long)]
-        peer_address: Option<SocketAddr>,
-    },
-    /// Put the synced pack into the game folder.
-    Load,
-    /// Take the pack out of the game folder, restoring everything that was there.
-    Unload,
-    /// What is set up, synced and loaded.
+    /// Take the pack out of the game: it is back as it was.
+    Disable,
+    /// What is set up, synced and enabled.
     Status,
-    /// Delete store files the current pack no longer uses.
+    /// Delete synced files the current pack no longer uses.
     Clean,
-    /// Make a pack from a mod list and share it.
+    /// Share a mod list: publish it, upload the pack to your secret gist, enable it here, and send files
+    /// to friends until Ctrl-C.
+    #[command(args_conflicts_with_subcommands = true)]
     Host {
+        /// The mod list (default: modlist.json in this folder).
+        list: Option<PathBuf>,
+        /// Also write the pack to a file.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Don't upload the pack to a gist.
+        #[arg(long)]
+        no_upload: bool,
+        /// Listen on this address without relays (local tests).
+        #[arg(long, hide = true)]
+        bind: Option<SocketAddr>,
         #[command(subcommand)]
-        command: HostCommand,
+        command: Option<HostCommand>,
     },
 }
 
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Resolve a mod list into a pack; prints your code (it never changes).
-    Publish {
-        list: PathBuf,
-        /// Also write the pack to a file (e.g. to attach to a release).
-        #[arg(long)]
-        output: Option<PathBuf>,
-    },
-    /// Send files to friends who have no Nexus key, or whose downloads fail (Ctrl-C to stop).
-    Serve {
-        /// Listen on this address without relays (local tests).
-        #[arg(long)]
-        bind: Option<SocketAddr>,
-    },
     /// Add a Nexus mod to a list from the link of one of its files.
     Add { list: PathBuf, link: String },
 }
@@ -107,7 +106,7 @@ fn net() -> Result<Net> {
     Net::new(config::nexus_key()?)
 }
 
-/// A loaded or half-loaded pack comes out first (the game must not be running).
+/// An enabled or half-enabled pack comes out first (the game must not be running).
 fn clean_game(g: &Game) -> Result<()> {
     if g.state() != deploy::State::Clean {
         launch::refuse_if_running()?;
@@ -116,7 +115,13 @@ fn clean_game(g: &Game) -> Result<()> {
     Ok(())
 }
 
-const NO_KEY: &str = "Without a Premium Nexus key every mod comes from the host, who must be running `sms host serve` while you sync.";
+const NO_KEY: &str = "Without a Premium Nexus key every mod comes from the host, who must have `sms host` running while you sync.";
+
+/// The folder this program sits in, when it is a Skyrim folder.
+fn beside_game() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    dir.join("SkyrimSE.exe").is_file().then_some(dir)
+}
 
 fn setup(
     game: Option<PathBuf>,
@@ -127,23 +132,25 @@ fn setup(
     interactive: bool,
 ) -> Result<Value> {
     let mut s = Settings::load()?;
-    let game = match game.or(s.game.clone()) {
+    let game = match game.or_else(beside_game).or(s.game.clone()) {
         Some(g) => g,
         None => {
             let found = steam::installs(&steam::steam_roots());
             match found.len() {
                 1 => found[0].game.clone(),
-                0 => config::ask_folder(
+                0 => config::ask(
                     "Skyrim not found in Steam. Its folder (with SkyrimSE.exe)?",
+                    None,
                     interactive,
-                )?,
+                )?
+                .into(),
                 _ => {
                     return Err(Error::new(
                         "game_ambiguous",
                         format!(
-                            "Several Skyrim installs: {}. Pick one with --game.",
-                            steam::describe(&found)
-                        ),
+                        "Several Skyrim installs: {}. Put sms in the one to use, or pass --game.",
+                        steam::describe(&found)
+                    ),
                     ))
                 }
             }
@@ -153,10 +160,18 @@ fn setup(
     files::require(&game, "SkyrimSE.exe")?;
     let store = match store.or(s.store.clone()) {
         Some(p) => p,
-        None => config::ask_folder(
-            "Folder for synced mods (same drive as Skyrim: hardlinks, no copies)?",
-            interactive,
-        )?,
+        None => {
+            let near = steam::library_of(&game)
+                .or_else(|| game.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| game.clone())
+                .join("SkyrimModSync");
+            config::ask(
+                "Folder for mods (on the same drive as Skyrim)?",
+                Some(&near.to_string_lossy()),
+                interactive,
+            )?
+            .into()
+        }
     };
     std::fs::create_dir_all(&store)?;
     let store = files::root(&store)?;
@@ -193,6 +208,22 @@ fn setup(
     Ok(json!({"state": "ready", "settings": s, "nexus_premium": nexus, "note": note}))
 }
 
+/// The settings, asking for what is missing first (the first run).
+fn ready(interactive: bool) -> Result<Settings> {
+    let s = Settings::load()?;
+    let moved = beside_game()
+        .and_then(|b| files::root(&b).ok())
+        .is_some_and(|b| Some(b) != s.game);
+    if s.game.is_none() || s.store.is_none() || moved {
+        let r = setup(None, None, None, None, false, interactive)?;
+        if r["nexus_premium"] != true {
+            eprintln!("{NO_KEY}");
+        }
+        return Settings::load();
+    }
+    Ok(s)
+}
+
 /// Syncs the given pack, or without one this machine's published pack (host) or the last one.
 fn do_sync(
     source: Option<String>,
@@ -202,27 +233,23 @@ fn do_sync(
 ) -> Result<Value> {
     clean_game(g)?;
     let net = net()?;
-    if source.is_none() {
-        if let Some(own) = Host::open()?.published()? {
-            return sync::sync(&own.pack, g, st, &net, None, Some(&own));
-        }
-    }
+    let source = source.filter(|s| !s.trim().is_empty());
     let remembered = st.root.join("source.txt");
-    let source = match source {
-        Some(s) => s,
-        None => std::fs::read_to_string(&remembered).map_err(|_| {
-            Error::new(
+    let source = match source.or_else(|| std::fs::read_to_string(&remembered).ok()) {
+        Some(s) => sync::source(&s),
+        None => {
+            if let Some(own) = Host::open()?.published()? {
+                return sync::sync(&own.pack, g, st, &net, None, Some(&own));
+            }
+            return Err(Error::new(
                 "pack_required",
-                "Which pack? `sms play github:OWNER/REPO` (or a link, file or code).",
-            )
-        })?,
+                "Which pack? `sms enable <code>` with the code your host gave you.",
+            ));
+        }
     };
-    let pack = sync::fetch_pack(source.trim(), &net, direct)?;
+    let pack = sync::fetch_pack(&source, &net, direct)?;
     let result = sync::sync(&pack, g, st, &net, direct, None)?;
-    files::write_atomic(&remembered, source.trim().as_bytes())?;
-    if net.key.is_none() {
-        eprintln!("{NO_KEY}");
-    }
+    files::write_atomic(&remembered, source.as_bytes())?;
     Ok(result)
 }
 
@@ -230,18 +257,142 @@ fn do_load(g: &Game, st: &Store) -> Result<Value> {
     clean_game(g)?;
     let pack = st
         .pack()?
-        .ok_or_else(|| Error::new("not_synced", "Nothing synced yet: `sms play <pack>`."))?;
+        .ok_or_else(|| Error::new("not_synced", "Nothing synced yet: `sms enable <code>`."))?;
     let plan = deploy::plan(&pack, g, &mut st.hashes(), |e| {
         st.has(&e.hash, e.size).then(|| st.object(&e.hash))
     })?;
     deploy::load(g, &plan, &pack.name)
 }
 
+const PLAY: &str = "Start Skyrim from Steam. `sms disable` puts your game back as it was.";
+
+fn enable(code: Option<String>, direct: Option<SocketAddr>, s: &Settings) -> Result<Value> {
+    let (g, st) = (game(s)?, store(s)?);
+    launch::refuse_if_running()?;
+    let synced = do_sync(code, direct, &g, &st)?;
+    let loaded = do_load(&g, &st)?;
+    Ok(json!({
+        "state": "enabled",
+        "pack": loaded["pack"],
+        "downloaded_archives": synced["archives"],
+        "files_from_host": synced["host_files"],
+        "note": PLAY
+    }))
+}
+
+/// No command: set up if needed, ask for the pack code, enable it.
+fn guided(interactive: bool) -> Result<Value> {
+    if !interactive {
+        return Err(Error::new(
+            "command_required",
+            "Name a command (see --help).",
+        ));
+    }
+    let s = ready(interactive)?;
+    let last = std::fs::read_to_string(store(&s)?.root.join("source.txt")).ok();
+    let code = config::ask("Pack code (paste it here)?", last.as_deref(), interactive)?;
+    enable(Some(code), None, &s)
+}
+
+/// The mod list `sms host` reads by default.
+fn default_list() -> Result<PathBuf> {
+    let here = PathBuf::from("modlist.json");
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("modlist.json")));
+    std::iter::once(here)
+        .chain(beside)
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            Error::new(
+                "list_required",
+                "No modlist.json here: name your mod list, or start one with `sms host add modlist.json <nexus file link>`.",
+            )
+        })
+}
+
+/// Saves the pack to this host's gist (a new one the first time); returns the gist id.
+fn upload(h: &Host, net: &Net, interactive: bool) -> Result<String> {
+    let pack = h
+        .published()?
+        .ok_or_else(|| Error::new("not_published", "Nothing published."))?
+        .pack;
+    let files = [("pack.json", serde_json::to_string_pretty(&pack)?)];
+    let description = format!("{} (SkyrimModSync pack)", pack.name);
+    let token = config::github_token(interactive)?;
+    let saved = match net.gist_save(&token, h.gist().as_deref(), &description, &files) {
+        Err(e) if e.code == "gist_missing" => net.gist_save(&token, None, &description, &files),
+        Err(e) if e.code == "github_token" => {
+            config::forget_github_token()?;
+            Err(e)
+        }
+        other => other,
+    }?;
+    h.set_gist(&saved)?;
+    Ok(saved)
+}
+
+fn host(
+    list: Option<PathBuf>,
+    output: Option<PathBuf>,
+    no_upload: bool,
+    bind: Option<SocketAddr>,
+    json_mode: bool,
+) -> Result<Value> {
+    let interactive = !json_mode;
+    let list = match list {
+        Some(l) => l,
+        None => default_list()?,
+    };
+    let s = ready(interactive)?;
+    let (g, st) = (game(&s)?, store(&s)?);
+    launch::refuse_if_running()?;
+    clean_game(&g)?;
+    let h = Host::open()?;
+    let net = net()?;
+    let published = h.publish(&list, &g.root, &net, output.as_deref())?;
+    let code = if no_upload {
+        None
+    } else {
+        Some(upload(&h, &net, interactive)?)
+    };
+    let own = h
+        .published()?
+        .ok_or_else(|| Error::new("not_published", "Nothing published."))?;
+    sync::sync(&own.pack, &g, &st, &net, None, Some(&own))?;
+    do_load(&g, &st)?;
+    let _ = std::fs::remove_file(st.root.join("source.txt"));
+    peer::serve(
+        h.key()?,
+        own,
+        bind,
+        |peer_code| {
+            if json_mode {
+                println!(
+                    "{}",
+                    json!({"state": "serving", "code": code, "host_code": peer_code, "published": published})
+                );
+                return;
+            }
+            match &code {
+                Some(c) => println!("\nPack code: {c}\nFriends: put sms in their Skyrim folder, run it and paste the code."),
+                None => println!("\nPack code (no gist): {peer_code}"),
+            }
+            println!("Your game has the pack too: start Skyrim from Steam.");
+            println!("Leave this open while friends sync: it sends them files Nexus can't (Ctrl-C to stop).");
+        },
+        || skyrim_mod_sync::CANCELLED.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    Ok(
+        json!({"state": "stopped", "note": "The pack stays enabled here; `sms disable` takes it out."}),
+    )
+}
+
 fn status() -> Result<Value> {
     let s = Settings::load()?;
     let mut out = json!({"settings": s, "nexus_key": config::nexus_key()?.is_some()});
     if let (Ok(g), Ok(st)) = (game(&s), store(&s)) {
-        out["loaded"] = match g.state() {
+        out["enabled"] = match g.state() {
             deploy::State::Clean => json!(false),
             deploy::State::Interrupted => json!("interrupted (the next command undoes it)"),
             deploy::State::Loaded(name) => json!(name),
@@ -251,12 +402,18 @@ fn status() -> Result<Value> {
                 json!({"pack": p.name, "files": p.files.len(), "plugins": p.plugins.len()});
         }
     }
+    if let Some(g) = Host::open()?.gist() {
+        out["your_pack_code"] = json!(g);
+    }
     Ok(out)
 }
 
-fn run(cli: Cli) -> Result<Value> {
-    let interactive = !cli.json;
-    match cli.command {
+fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
+    let interactive = !json_mode;
+    let Some(command) = command else {
+        return guided(interactive);
+    };
+    match command {
         Command::Setup {
             game,
             store,
@@ -264,65 +421,31 @@ fn run(cli: Cli) -> Result<Value> {
             documents,
             key_stdin,
         } => setup(game, store, local, documents, key_stdin, interactive),
-        Command::Play { pack, peer_address } => {
-            let s = Settings::load()?;
-            let (g, st) = (game(&s)?, store(&s)?);
-            launch::refuse_if_running()?;
-            let synced = do_sync(pack, peer_address, &g, &st)?;
-            let loaded = do_load(&g, &st)?;
-            launch::start()?;
-            Ok(
-                json!({"state": "started", "synced": synced, "loaded": loaded, "note": "Run `sms unload` after playing."}),
-            )
-        }
-        Command::Sync { pack, peer_address } => {
-            let s = Settings::load()?;
-            do_sync(pack, peer_address, &game(&s)?, &store(&s)?)
-        }
-        Command::Load => {
-            let s = Settings::load()?;
-            do_load(&game(&s)?, &store(&s)?)
-        }
-        Command::Unload => {
+        Command::Enable { code, peer_address } => enable(code, peer_address, &ready(interactive)?),
+        Command::Disable => {
             let g = game(&Settings::load()?)?;
             launch::refuse_if_running()?;
-            deploy::unload(&g)
+            let r = deploy::unload(&g)?;
+            Ok(
+                json!({"state": "disabled", "restored": r["restored"], "note": "Your game is back as it was. `sms enable` turns the pack on again."}),
+            )
         }
         Command::Status => status(),
         Command::Clean => {
             let freed = store(&Settings::load()?)?.clean()?;
             Ok(json!({"state": "cleaned", "freed_bytes": freed}))
         }
-        Command::Host { command } => {
-            let h = Host::open()?;
-            match command {
-                HostCommand::Publish { list, output } => {
-                    let game = config::require(&Settings::load()?.game, "game folder")?;
-                    h.publish(&list, &game, &net()?, output.as_deref())
-                }
-                HostCommand::Add { list, link } => h.add(&list, &link, &net()?),
-                HostCommand::Serve { bind } => {
-                    let published = h.published()?.ok_or_else(|| {
-                        Error::new("not_published", "Publish first: `sms host publish <list>`.")
-                    })?;
-                    let json_mode = cli.json;
-                    peer::serve(
-                        h.key()?,
-                        published,
-                        bind,
-                        |code| {
-                            if json_mode {
-                                println!("{}", json!({"state": "serving", "code": code}));
-                            } else {
-                                println!("Serving. Friends without a Nexus key run: sms play {code}\n(Ctrl-C to stop)");
-                            }
-                        },
-                        || skyrim_mod_sync::CANCELLED.load(std::sync::atomic::Ordering::Relaxed),
-                    )?;
-                    Ok(json!({"state": "stopped"}))
-                }
-            }
-        }
+        Command::Host {
+            command: Some(HostCommand::Add { list, link }),
+            ..
+        } => Host::open()?.add(&list, &link, &net()?),
+        Command::Host {
+            list,
+            output,
+            no_upload,
+            bind,
+            command: None,
+        } => host(list, output, no_upload, bind, json_mode),
     }
 }
 
@@ -368,19 +491,34 @@ fn human(v: &Value, indent: usize, out: &mut String) {
     }
 }
 
+/// Started by a double-click on Windows: keep the window open to read the result.
+fn pause() {
+    if io::stdin().is_terminal() {
+        eprintln!("\nPress Enter to close.");
+        let _ = io::stdin().read_line(&mut String::new());
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_mode = cli.json;
+    let hold = cfg!(windows) && cli.command.is_none() && !json_mode;
+    skyrim_mod_sync::JSON.store(json_mode, std::sync::atomic::Ordering::Relaxed);
     let _ = ctrlc::set_handler(|| {
         skyrim_mod_sync::CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed)
     });
-    match run(cli) {
+    let code = match run(cli.command, json_mode) {
         Ok(v) => {
             if json_mode {
                 println!("{v}");
             } else {
+                let mut v = v;
+                let note = v.as_object_mut().and_then(|m| m.remove("note"));
                 let mut out = String::new();
                 human(&v, 0, &mut out);
+                if let Some(Value::String(n)) = note {
+                    out.push_str(&format!("\n{n}\n"));
+                }
                 print!("{out}");
             }
             ExitCode::SUCCESS
@@ -396,5 +534,9 @@ fn main() -> ExitCode {
             }
             ExitCode::from(if e.code == "cancelled" { 130 } else { 2 })
         }
+    };
+    if hold {
+        pause();
     }
+    code
 }

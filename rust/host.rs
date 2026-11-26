@@ -55,6 +55,16 @@ impl Host {
         }
         Ok(Some(files::read_json(&p)?))
     }
+    /// The secret gist this host shares its pack in.
+    pub fn gist(&self) -> Option<String> {
+        std::fs::read_to_string(self.dir.join("gist"))
+            .ok()
+            .map(|g| g.trim().to_owned())
+            .filter(|g| !g.is_empty())
+    }
+    pub fn set_gist(&self, id: &str) -> Result<()> {
+        files::write_atomic(&self.dir.join("gist"), id.as_bytes())
+    }
     pub fn downloads(&self) -> PathBuf {
         self.dir.join("cache/downloads")
     }
@@ -76,7 +86,7 @@ impl Host {
         if folder.state() != deploy::State::Clean {
             return Err(Error::new(
                 "pack_loaded",
-                "Your game folder has a pack loaded: `sms unload` first.",
+                "Your game folder has a pack loaded: `sms disable` first.",
             ));
         }
         let mut cache = hash::Cache::open(&self.dir.join("cache/hashes.json"));

@@ -48,29 +48,44 @@ pub fn require(value: &Option<PathBuf>, what: &str) -> Result<PathBuf> {
     })
 }
 
-/// Asks for a folder at a terminal; refuses in --json mode.
-pub fn ask_folder(question: &str, interactive: bool) -> Result<PathBuf> {
+/// Asks at a terminal (Enter takes `default`); refuses in --json mode. Empty when skipped.
+pub fn ask(question: &str, default: Option<&str>, interactive: bool) -> Result<String> {
     if !interactive || !io::stdin().is_terminal() {
         return Err(Error::new(
             "setup_required",
-            format!("{question} Pass it as a flag."),
+            format!("{question} Pass it as an argument."),
         ));
     }
-    eprint!("{question} ");
+    match default {
+        Some(d) => eprint!("{question} [Enter: {d}] "),
+        None => eprint!("{question} "),
+    }
     io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
-    Ok(PathBuf::from(line.trim()))
+    let line = line.trim().trim_matches('"').to_owned();
+    Ok(if line.is_empty() {
+        default.unwrap_or_default().to_owned()
+    } else {
+        line
+    })
 }
 
-fn key_path() -> Result<PathBuf> {
-    Ok(directory()?.join("nexus-api-key"))
-}
-pub fn nexus_key() -> Result<Option<String>> {
-    Ok(fs::read_to_string(key_path()?)
+fn secret(name: &str) -> Result<Option<String>> {
+    Ok(fs::read_to_string(directory()?.join(name))
         .ok()
         .map(|k| k.trim().to_owned())
         .filter(|k| !k.is_empty()))
+}
+fn save_secret(name: &str, value: &str) -> Result<()> {
+    let path = directory()?.join(name);
+    files::write_atomic(&path, value.as_bytes())?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+pub fn nexus_key() -> Result<Option<String>> {
+    secret("nexus-api-key")
 }
 /// A key from one line of stdin, or asked at a terminal (hidden; Enter skips). None when skipped.
 pub fn read_key(stdin: bool, interactive: bool) -> Result<Option<String>> {
@@ -88,9 +103,58 @@ pub fn read_key(stdin: bool, interactive: bool) -> Result<Option<String>> {
     Ok(Some(key.trim().to_owned()).filter(|k| !k.is_empty()))
 }
 pub fn save_key(key: &str) -> Result<()> {
-    let path = key_path()?;
-    files::write_atomic(&path, key.as_bytes())?;
-    #[cfg(unix)]
-    fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    save_secret("nexus-api-key", key)
+}
+
+/// A GitHub token for the pack's gist: GH_TOKEN/GITHUB_TOKEN, the GitHub CLI's login, the saved one,
+/// or asked once (hidden) and saved.
+pub fn github_token(interactive: bool) -> Result<String> {
+    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(t) = std::env::var(var).ok().filter(|t| !t.trim().is_empty()) {
+            return Ok(t.trim().to_owned());
+        }
+    }
+    if let Some(t) = gh_token() {
+        return Ok(t);
+    }
+    if let Some(t) = secret("github-token")? {
+        return Ok(t);
+    }
+    if !interactive || !io::stdin().is_terminal() {
+        return Err(Error::new(
+            "github_token",
+            "Sharing the pack needs a GitHub token with the gist scope: set GH_TOKEN, or `gh auth login`.",
+        ));
+    }
+    let t = rpassword::prompt_password(
+        "GitHub token, to share the pack as a secret gist (github.com/settings/tokens/new?scopes=gist): ",
+    )?;
+    let t = t.trim().to_owned();
+    if t.is_empty() {
+        return Err(Error::new("github_token", "No GitHub token given."));
+    }
+    save_secret("github-token", &t)?;
+    Ok(t)
+}
+
+/// The GitHub CLI's login: `gh auth token`, or older versions' `gh auth status --show-token`.
+fn gh_token() -> Option<String> {
+    let run = |args: &[&str]| std::process::Command::new("gh").args(args).output().ok();
+    if let Some(o) = run(&["auth", "token"]).filter(|o| o.status.success()) {
+        let t = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let o = run(&["auth", "status", "--show-token"])?;
+    let text = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
+    text.lines()
+        .find_map(|l| l.split_once("Token: ").map(|(_, t)| t.trim().to_owned()))
+        .filter(|t| !t.is_empty() && !t.starts_with('*'))
+}
+
+/// Forgets a saved GitHub token GitHub refused.
+pub fn forget_github_token() -> Result<()> {
+    let _ = fs::remove_file(directory()?.join("github-token"));
     Ok(())
 }

@@ -269,7 +269,7 @@ pub fn load(game: &Game, plan: &Plan, name: &str) -> Result<Value> {
     if game.state() != State::Clean {
         return Err(Error::new(
             "not_clean",
-            "A pack is loaded: `sms unload` first.",
+            "A pack is loaded: `sms disable` first.",
         ));
     }
     if let Some(e) = plan.missing.first() {

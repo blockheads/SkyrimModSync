@@ -1,7 +1,7 @@
 # SkyrimModSync: design
 
 `sms` shares a Skyrim mod setup between friends. A mod list resolves into a pack (every file, pinned by hash, with
-where its bytes come from); players sync it, load it into their game, play, and unload it.
+where its bytes come from); players sync it, enable it in their game, play, and disable it.
 
 Decisions (2026-11-25):
 
@@ -10,9 +10,13 @@ Decisions (2026-11-25):
 - **Our own mod list.** A JSON list with one source per mod (nexus, url, github, local) and a simple install rule
   (`folder`, `root`). Mod organizer setups (MO2, Vortex, Wabbajack) become converters into it later; the pack is the
   stable interface.
-- **Packs by link.** A pack with no host-only files needs no host online (`sms play github:OWNER/REPO` or any link,
-  e.g. a gist's raw link).
-- **No mod manager for players.** Load / Unload deploy the pack into the game folder, Vortex-style, journaled.
+- **A pack code is a secret gist's id** (v0.7). `sms host` uploads the pack there itself (the GitHub CLI's login, or
+  a token asked once). A pack with no host-only files needs no host online. Short codes would need a lookup service
+  we run; not worth it while codes are copy-pasted.
+- **No mod manager for players.** Enable / disable deploy the pack into the game folder, Vortex-style, journaled;
+  players start Skyrim from Steam (SKSE's loader sits in Steam's launcher slot).
+- **Double-click for players** (v0.7): `sms` in the Skyrim folder, run with no command, asks the mods folder, the
+  Nexus key and the pack code once; later runs take the last code with Enter. One command for hosts: `sms host`.
 - **Nexus only through the user's own API key** (Premium downloads; `sms setup` asks; without Premium the host saves
   archives by hand into `downloads/`, and players get the files from the host).
 - **CLI only for now**, `--json` everywhere. Linux and Windows releases.
@@ -23,13 +27,14 @@ Decisions (2026-11-25):
 ## The whole flow
 
 ```
-modlist.json (host writes) → sms host publish → pack.json (resolved, pinned)
+host:    sms host [modlist.json]
+         → unload own pack → publish (resolve, pin) → pack.json to the host's secret gist
+         → enable here → serve files until Ctrl-C (needed for players without Premium, local files)
 pack  = files {path, size, blake3, from} + plugins + loadorder + ini + host id
         from = base (player's own copy must match) | archive{hash, member} | host
 
-players: sms setup (folders, Nexus key) → sms play <pack link | github:OWNER/REPO | code>
-         (fetch pack, sync, load, steam://run/489830) → sms unload; later `sms play`
-host:    sms host serve only when someone has no Premium key (or for local files)
+players: sms (no command; setup on the first run) → pack code (gist id or link)
+         → fetch pack, sync, enable → Play in Steam → sms disable
 ```
 
 ## 1. The mod list (`list.rs`)
@@ -71,14 +76,14 @@ archives 3 at a time: Nexus link (key) or URL → hash checked → wanted member
 any failure / no key → those files from the host
 ```
 
-## 5. Load / unload (`deploy.rs`)
+## 5. Enable / disable (`deploy.rs`)
 
 ```
 one walk of the game folder (folded path → real casing)
 plan: Dir, Aside (friend's Data/ files not in the pack), Place (hardlink; config copied;
       SKSE's loader in SkyrimSELauncher.exe), User (Plugins.txt, loadorder.txt, INIs merged)
 journal.json written once → carried out → `loaded` marker
-unload: journal backwards, each step tolerant of one that never ran; interrupted = undone first
+disable: journal backwards, each step tolerant of one that never ran; interrupted = undone first
 ```
 
 Measured on v0.5 (this machine, 22 GB clean game, page cache smaller than the data): a cold publish read 10-17 s
@@ -93,4 +98,5 @@ already have.
 
 ## Not yet tested
 
-Windows gameplay, `steam://run` itself, P2P over the internet, a real Nexus Premium download.
+Windows gameplay, Steam's Play starting SKSE through the launcher slot, a real Nexus Premium download. Tested in
+v0.7: the double-click flow on a fake game, P2P through iroh's public relays (same machine), the real gist upload.

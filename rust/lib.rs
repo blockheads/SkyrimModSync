@@ -85,7 +85,25 @@ pub fn check_cancel() -> Result<()> {
     }
     Ok(())
 }
+/// --json: progress as JSON lines.
+pub static JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// A progress line on stderr (the result goes to stdout).
 pub fn event(state: &str, detail: serde_json::Value) {
-    eprintln!("{}", serde_json::json!({"state": state, "detail": detail}));
+    if JSON.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", serde_json::json!({"state": state, "detail": detail}));
+        return;
+    }
+    let fields = match &detail {
+        serde_json::Value::Object(m) => m
+            .iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => format!("{k}: {s}"),
+                _ => format!("{k}: {v}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    };
+    eprintln!("{}: {fields}", state.replace('_', " "));
 }
