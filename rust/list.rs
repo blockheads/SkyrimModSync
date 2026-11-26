@@ -35,7 +35,8 @@ pub struct Mod {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<Github>,
-    /// A folder (or archive) next to the list; the host sends its files.
+    /// A folder or archive (next to the list, or absolute; `*` in its name: the newest match); the host
+    /// sends its files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<String>,
     /// Only this folder inside the archive is installed (archives that wrap their contents).

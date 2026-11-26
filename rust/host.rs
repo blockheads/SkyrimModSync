@@ -147,13 +147,28 @@ impl Host {
             // (path inside the mod, size, hash, where the bytes are on this machine, the archive)
             let mut found: Vec<(String, u64, String, From)> = vec![];
             let source;
-            if let Some(dir) = &m.local {
+            if let Some(local_path) = &m.local {
                 source = "host".to_owned();
-                let walked = files::walk(&list_dir.join(dir))?;
-                let paths: Vec<PathBuf> = walked.values().cloned().collect();
-                for ((rel, path), (size, hash)) in walked.into_iter().zip(cache.many(&paths)?) {
-                    local.insert(hash.clone(), path);
-                    found.push((rel, size, hash, From::Host));
+                let at = local_source(list_dir, local_path)?;
+                if at.is_dir() {
+                    let walked = files::walk(&at)?;
+                    let paths: Vec<PathBuf> = walked.values().cloned().collect();
+                    for ((rel, path), (size, hash)) in walked.into_iter().zip(cache.many(&paths)?) {
+                        local.insert(hash.clone(), path);
+                        found.push((rel, size, hash, From::Host));
+                    }
+                } else {
+                    // An archive (a build's package): friends get its files from the host.
+                    crate::say(
+                        "local_archive",
+                        &format!("{}: {}", m.name, at.display()),
+                        json!({"mod": m.name, "archive": at}),
+                    );
+                    let (_, hash) = cache.one(&at)?;
+                    for member in self.members(&at, &hash)? {
+                        members.insert(member.hash.clone(), (at.clone(), member.name.clone()));
+                        found.push((member.name, member.size, member.hash, From::Host));
+                    }
                 }
             } else {
                 let (path, origin, name) = fetched.remove(&i).expect("fetched above");
@@ -437,6 +452,36 @@ impl Host {
             json!({"state": "added", "mod": name, "note": "Add its plugins to \"plugins\" if it has any."}),
         )
     }
+}
+
+/// A local mod's folder or archive: next to the list, or absolute. A `*` in the last part picks the
+/// newest match (`build/package/SkyrimCoop-*.zip`: the latest build).
+fn local_source(list_dir: &Path, local: &str) -> Result<PathBuf> {
+    let path = list_dir.join(local);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let missing = || Error::new("missing_file", format!("Nothing at {}.", path.display()));
+    let Some((before, after)) = name.split_once('*') else {
+        return if path.exists() {
+            Ok(path)
+        } else {
+            Err(missing())
+        };
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::read_dir(dir)
+        .map_err(|_| missing())?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.len() >= before.len() + after.len() && n.starts_with(before) && n.ends_with(after)
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .max()
+        .map(|(_, p)| p)
+        .ok_or_else(missing)
 }
 
 fn file_name(url: &str) -> String {

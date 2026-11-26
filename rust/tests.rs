@@ -399,6 +399,32 @@ fn a_pack_without_host_files_needs_no_host() {
 }
 
 #[test]
+fn a_local_build_archive_newest_first_comes_from_the_host() {
+    let w = world();
+    let list = LIST.replace(r#""local": "B""#, r#""local": "pkg/B-*.zip""#);
+    write(&w.root, "list/modlist.json", list.as_bytes());
+    write(&w.root, "list/pkg/B-old.zip", &zip(&[("B.esp", b"old")]));
+    let newest = zip(&[("B.esp", b"new-build"), ("d3dx9_42.dll", b"root-file")]);
+    write(&w.root, "list/pkg/B-new.zip", &newest);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(w.root.join("list/pkg/B-new.zip"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    w.publish();
+    let (addr, stop) = w.serve();
+    let code = w.host.key().unwrap().public().to_string();
+    let synced = w.sync(&code, Some("friend"), Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(synced["host_files"], 2, "the newest build's two files");
+    w.load();
+    assert_eq!(w.read("Data/B.esp"), b"new-build");
+    assert_eq!(w.read("d3dx9_42.dll"), b"root-file", "root rule applies");
+}
+
+#[test]
 fn without_a_key_nexus_mods_come_from_the_host() {
     let w = world();
     w.publish();

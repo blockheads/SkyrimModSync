@@ -42,7 +42,9 @@ Write a mod list, `modlist.json`:
 }
 ```
 
-Each mod comes from `nexus`, `url`, `github` (newest release) or `local` (a folder next to the list). Its
+Each mod comes from `nexus`, `url`, `github` (newest release) or `local`: a folder or archive, next to the
+list or absolute, sent by the host over P2P. A `*` in a local name picks the newest match, so
+`"local": "/path/to/build/package/MyMod-*.zip"` shares your latest build with no release. Its
 files go into `Data/`; `folder` picks a folder inside the archive, `root` lists files that go next to
 `SkyrimSE.exe`. Later mods win conflicts. `sms host add modlist.json <nexus file link>` adds a Nexus mod.
 

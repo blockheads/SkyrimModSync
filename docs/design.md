@@ -45,7 +45,7 @@ players: sms (no command; setup on the first run) → pack code (gist id or link
 ## 1. The mod list (`list.rs`)
 
 ```
-mod = name + one source: nexus{mod, file} | url | github{repo, asset?} | local (folder)
+mod = name + one source: nexus{mod, file} | url | github{repo, asset?} | local (folder or archive; * = newest)
       + folder (only that folder inside the archive) + root (files beside SkyrimSE.exe)
 install rule: root files → game root; Data/… → Data/; a mod with a Data/ folder installs
 only that and its root files (SKSE: skips src/); otherwise everything → Data/; fomod/ never
