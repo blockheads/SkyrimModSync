@@ -88,6 +88,13 @@ pub fn check_cancel() -> Result<()> {
 /// --json: progress as JSON lines.
 pub static JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+type Sink = Box<dyn Fn(&str) + Send + Sync>;
+static SINK: std::sync::OnceLock<Sink> = std::sync::OnceLock::new();
+/// Progress lines go to `sink` instead of stderr (the GUI).
+pub fn set_event_sink(sink: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = SINK.set(Box::new(sink));
+}
+
 /// A progress line on stderr (the result goes to stdout).
 pub fn event(state: &str, detail: serde_json::Value) {
     if JSON.load(std::sync::atomic::Ordering::Relaxed) {
@@ -105,5 +112,9 @@ pub fn event(state: &str, detail: serde_json::Value) {
             .join(", "),
         other => other.to_string(),
     };
-    eprintln!("{}: {fields}", state.replace('_', " "));
+    let line = format!("{}: {fields}", state.replace('_', " "));
+    match SINK.get() {
+        Some(sink) => sink(&line),
+        None => eprintln!("{line}"),
+    }
 }

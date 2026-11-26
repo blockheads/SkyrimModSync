@@ -422,6 +422,119 @@ fn without_a_key_nexus_mods_come_from_the_host() {
 }
 
 #[test]
+fn game_bsas_and_cc_plugins_missing_or_another_version_come_from_the_host_and_go_back_on_unload() {
+    let w = world();
+    write(&w.root, "game/Data/Skyrim - Textures0.bsa", b"textures-1.7");
+    write(&w.root, "game/Data/ccBGSSSE001-Fish.bsa", b"fish");
+    write(&w.root, "game/Data/ccBGSSSE001-Fish.esm", b"fish-plugin");
+    write(
+        &w.root,
+        "game/Skyrim.ccc",
+        b"ccBGSSSE001-Fish.esm\r\nccQDRSSE001-SurvivalMode.esl\r\n",
+    );
+    write(
+        &w.friend.root,
+        "Skyrim.ccc",
+        b"ccQDRSSE001-SurvivalMode.esl\r\n",
+    );
+    write(
+        &w.friend.root,
+        "Data/Skyrim - Textures0.bsa",
+        b"textures-1.6",
+    );
+    let before = w.friend_tree();
+    w.publish();
+    let (addr, stop) = w.serve();
+    let synced = w.sync("github:fake/pack", Some("friend"), Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(
+        synced["host_files"], 7,
+        "B's 3 files, 2 BSAs, the cc plugin and Skyrim.ccc"
+    );
+    w.load();
+    assert_eq!(w.read("Data/Skyrim - Textures0.bsa"), b"textures-1.7");
+    assert_eq!(w.read("Data/ccBGSSSE001-Fish.bsa"), b"fish");
+    assert_eq!(w.read("Data/ccBGSSSE001-Fish.esm"), b"fish-plugin");
+    assert_eq!(
+        w.read("Skyrim.ccc"),
+        b"ccBGSSSE001-Fish.esm\r\nccQDRSSE001-SurvivalMode.esl\r\n"
+    );
+    deploy::unload(&w.friend).unwrap();
+    assert_eq!(
+        w.friend_tree(),
+        before,
+        "the friend's own BSA is back, the added one gone"
+    );
+}
+
+#[test]
+fn check_lists_what_is_out_of_sync_and_downloads_nothing() {
+    let w = world();
+    write(&w.root, "game/Data/Skyrim - Textures0.bsa", b"textures-1.7");
+    write(&w.root, "game/Data/ccBGSSSE001-Fish.esm", b"fish-plugin");
+    write(
+        &w.friend.root,
+        "Data/Skyrim - Textures0.bsa",
+        b"textures-1.6",
+    );
+    let before = w.friend_tree();
+    w.publish();
+    let net = w.net(Some("friend"));
+    let pack = sync::fetch_pack("github:fake/pack", &net, None).unwrap();
+    let c = sync::check(&pack, &w.friend, &w.store()).unwrap();
+    let from = |name: &str| c.mods.iter().find(|m| m.name == name).map(|m| m.from);
+    assert_eq!((from("A"), from("B")), (Some("nexus"), Some("host")));
+    assert_eq!(c.mods.iter().find(|m| m.name == "B").unwrap().files, 3);
+    let state = |p: &str| c.game_files.iter().find(|f| f.path == p).map(|f| f.state);
+    assert_eq!(state("Data/Skyrim - Textures0.bsa"), Some("different"));
+    assert_eq!(state("Data/ccBGSSSE001-Fish.esm"), Some("missing"));
+    assert!(c.set_aside.iter().any(|p| p == "Data/Friend.esp"));
+    assert!(c.download_bytes > 0);
+    assert_eq!(w.friend_tree(), before, "the game is untouched");
+    assert!(
+        !pack
+            .files
+            .iter()
+            .any(|e| e.from != From::Base && w.store().has(&e.hash, e.size)),
+        "nothing downloaded"
+    );
+
+    let (addr, stop) = w.serve();
+    w.sync("github:fake/pack", Some("friend"), Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    let c = sync::check(&pack, &w.friend, &w.store()).unwrap();
+    assert!(!c.needs_download(), "synced: nothing left to get");
+}
+
+#[test]
+fn each_player_keeps_their_own_language_voices() {
+    let w = world();
+    write(&w.root, "game/Data/Skyrim - Voices_en0.bsa", b"english");
+    write(&w.friend.root, "Data/Skyrim - Voices_de0.bsa", b"german");
+    w.publish();
+    let pack = w.host.published().unwrap().unwrap().pack;
+    assert!(!pack.files.iter().any(|e| e.path.contains("Voices")));
+    let (addr, stop) = w.serve();
+    let synced = w.sync("github:fake/pack", Some("friend"), Some(addr));
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(synced["host_files"], 3, "B's files only");
+    w.load();
+    assert_eq!(w.read("Data/Skyrim - Voices_de0.bsa"), b"german");
+    assert!(!w.friend.root.join("Data/Skyrim - Voices_en0.bsa").exists());
+}
+
+#[test]
+fn other_game_files_that_differ_still_stop_the_sync() {
+    let w = world();
+    write(&w.friend.root, "Data/Skyrim.esm", b"another version");
+    w.publish();
+    let net = w.net(Some("friend"));
+    let pack = sync::fetch_pack("github:fake/pack", &net, None).unwrap();
+    let err = sync::sync(&pack, &w.friend, &w.store(), &net, None, None).unwrap_err();
+    assert_eq!(err.code, "game_differs");
+}
+
+#[test]
 fn a_load_cut_short_is_undone() {
     let w = world();
     let before = w.friend_tree();

@@ -1,4 +1,5 @@
-//! What a pack may carry: licensed files are matched, never sent; logs, saves and executables never travel.
+//! What a pack may carry: licensed files are matched (BSAs and Creation Club plugins are sent by the host
+//! when a friend's differ); logs, saves and executables never travel.
 use crate::{
     files::{self, fold},
     Error, Result,
@@ -7,10 +8,16 @@ use std::path::Path;
 
 /// The INIs under Documents/My Games/Skyrim Special Edition the pack carries (shared sections).
 pub const DOCUMENTS: [&str; 3] = ["Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"];
-/// Licensed game content: always the friend's own copy, never sent or downloaded.
+/// Licensed game content: the friend's own copy must match (except what `host_sends`).
 pub fn protected(path: &str) -> bool {
     let name = fold(path);
-    ["skyrimse.exe", "steam_api64.dll", "bink2w64.dll"].contains(&name.as_str())
+    [
+        "skyrimse.exe",
+        "steam_api64.dll",
+        "bink2w64.dll",
+        "skyrim.ccc",
+    ]
+    .contains(&name.as_str())
         || ["skyrim", "update", "dawnguard", "hearthfires", "dragonborn"]
             .iter()
             .any(|n| {
@@ -22,6 +29,18 @@ pub fn protected(path: &str) -> bool {
             && (name.ends_with(".esm") || name.ends_with(".esl") || name.ends_with(".bsa"))
         || name == "data/_resourcepack.esl"
         || name == "data/_resourcepack.bsa"
+}
+
+/// Licensed files the host sends when a friend's is missing or another version: the BSAs and the
+/// Creation Club / Anniversary plugins (cc*.esm/esl, _ResourcePack.esl) and Skyrim.ccc, which names the
+/// cc plugins the game loads.
+pub fn host_sends(path: &str) -> bool {
+    let n = fold(path);
+    protected(path)
+        && (n.ends_with(".bsa")
+            || n.starts_with("data/cc")
+            || n == "data/_resourcepack.esl"
+            || n == "skyrim.ccc")
 }
 
 /// Game executables and the launcher slot: no pack source may name one (except SkyrimSE.exe as base).
@@ -41,10 +60,12 @@ pub fn from_game_folder(path: &str) -> bool {
             && (n.ends_with(".dll") || n.ends_with(".exe"))
 }
 
-/// Data/ files that ship with the game or are its output: load leaves them where they are.
+/// Data/ files that ship with the game or are its output: load leaves them where they are, and the
+/// pack never names them. The voice BSA is the player's language (every other game BSA holds all of them).
 pub fn stays(path: &str) -> bool {
     let n = fold(path);
     n == "data/marketplacetextures.bsa"
+        || n.starts_with("data/skyrim - voices_") && n.ends_with(".bsa")
         || n.starts_with("data/video/")
         || n.starts_with("data/skse/plugins/logs/")
 }
@@ -106,6 +127,33 @@ mod tests {
         assert!(protected("SkyrimSE.exe"));
         assert!(!protected("Data/SkyrimCoopStart.esp"));
         assert!(!protected("skse64_loader.exe"));
+    }
+    #[test]
+    fn the_voice_bsa_stays_the_players_own() {
+        assert!(stays("Data/Skyrim - Voices_en0.bsa") && stays("data/skyrim - voices_de0.BSA"));
+        assert!(!stays("Data/Skyrim - Interface.bsa"));
+    }
+    #[test]
+    fn the_host_sends_licensed_bsas_and_creation_club_plugins_only() {
+        for p in [
+            "Data/Skyrim - Textures0.bsa",
+            "data/ccBGSSSE001-Fish.BSA",
+            "Data/ccBGSSSE001-Fish.esm",
+            "Data/ccQDRSSE001-SurvivalMode.esl",
+            "Data/_ResourcePack.esl",
+            "skyrim.CCC",
+        ] {
+            assert!(host_sends(p), "{p}");
+        }
+        for p in [
+            "Data/Skyrim.esm",
+            "Data/Update.esm",
+            "SkyrimSE.exe",
+            "Data/SomeMod.bsa",
+            "Data/ccMine.esp",
+        ] {
+            assert!(!host_sends(p), "{p}");
+        }
     }
     #[test]
     fn ignored_skips_saves_logs_and_our_state() {

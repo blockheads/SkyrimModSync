@@ -8,12 +8,17 @@ turn it off afterwards to get their own game back.
 1. Download `sms` from the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest)
    (Windows: `sms-windows-x86_64.exe`; Linux: `sms-linux-x86_64`, then `chmod +x` it) and put it in your
    Skyrim folder (the one with `SkyrimSE.exe`).
-2. Run it (double-click on Windows). The first time it asks where to keep mods and for your Nexus API key
-   (Enter skips it), then for the pack code your host gave you.
-3. Start Skyrim from Steam.
+2. Double-click it: a window opens. Check the folders, add your Nexus API key if you have one, paste the
+   pack code your host gave you and press **Check**.
+3. It lists what your game lacks (mods, game files from the host, your own mods it sets aside while the
+   pack is on). **Download and enable** gets it and turns the pack on.
+4. Start Skyrim from Steam.
 
-When you're done: `sms disable` puts your game back as it was; `sms enable` turns the pack on again. Run
-`sms` again to get the host's newest pack (Enter reuses the last code).
+When you're done, **Disable** (or `sms disable`) puts your game back as it was. Open it again and press
+Check to get the host's newest pack.
+
+From a terminal, `sms` asks the same questions as text: it lists what is out of sync and asks before
+downloading (`sms enable <code>`; `--yes` skips the question). `sms gui` opens the window on any system.
 
 A Premium Nexus key downloads Nexus mods from Nexus; without one, mods come from the host, who must have
 `sms host` running while you sync.
@@ -54,8 +59,14 @@ Without Nexus Premium, `sms host` lists the archives to save by hand into `downl
 
 ## Good to know
 
+- `sms check [code]` lists what is out of sync without downloading.
 - `sms status` shows what is set up and enabled; `sms clean` frees space from old versions.
-- Everyone needs the same Skyrim version and edition (Anniversary content included or not).
+- Everyone needs the same Skyrim version and edition (Anniversary content included or not). Game `.bsa`
+  files and Creation Club plugins (`cc*.esm`/`.esl`, `_ResourcePack.esl`, and `Skyrim.ccc`, which lists them) are the
+  exception: a friend missing
+  one, or with another version, gets the host's while the pack is on (`sms host` running), and their own back
+  on `sms disable`. Each player keeps their own language: the game's text is in every language
+  already, and the voice BSA (`Skyrim - Voices_en0.bsa`, `_de0`, …) stays the player's.
 - Respect mod permissions: share with friends only.
 
 ## Build

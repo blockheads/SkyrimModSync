@@ -93,10 +93,14 @@ impl Host {
         let mut chosen: BTreeMap<String, Entry> = BTreeMap::new();
         let base: Vec<(String, PathBuf)> = files::walk(&game)?
             .into_iter()
-            .filter(|(rel, _)| rules::protected(rel))
+            .filter(|(rel, _)| rules::protected(rel) && !rules::stays(rel))
             .collect();
         let hashes = cache.many(&base.iter().map(|b| b.1.clone()).collect::<Vec<_>>())?;
-        for ((path, _), (size, hash)) in base.into_iter().zip(hashes) {
+        let mut local = BTreeMap::new();
+        for ((path, real), (size, hash)) in base.into_iter().zip(hashes) {
+            if rules::host_sends(&path) {
+                local.insert(hash.clone(), real);
+            }
             chosen.insert(
                 fold(&path),
                 Entry {
@@ -136,7 +140,6 @@ impl Host {
                 ),
             ));
         }
-        let mut local = BTreeMap::new();
         let mut members = BTreeMap::new();
         let mut archives = BTreeMap::new();
         let mut reports = vec![];
@@ -253,7 +256,7 @@ impl Host {
         local.retain(|h, _| {
             pack.files
                 .iter()
-                .any(|e| &e.hash == h && e.from == From::Host)
+                .any(|e| &e.hash == h && matches!(e.from, From::Host | From::Base))
         });
         let published = Published {
             pack,
@@ -385,7 +388,7 @@ impl Host {
             "pack_file": output,
             "files": pack.files.len(),
             "bytes": pack.bytes(),
-            "from_host": published.local.len(),
+            "from_host": pack.files.iter().filter(|e| e.from == From::Host).count(),
             "mods": mods,
         }))
     }

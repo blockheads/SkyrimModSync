@@ -1,3 +1,5 @@
+mod gui;
+
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use skyrim_mod_sync::{
@@ -7,7 +9,9 @@ use skyrim_mod_sync::{
     host::Host,
     launch,
     net::Net,
-    peer, steam,
+    pack::Pack,
+    peer::{self, Published},
+    steam,
     store::Store,
     sync, Error, Result,
 };
@@ -53,10 +57,23 @@ enum Command {
         key_stdin: bool,
     },
     /// Sync a pack and put it in the game; then start Skyrim from Steam. Without a code: the last one.
+    /// Lists what is out of sync and asks before downloading.
     Enable {
         #[arg(help = PACK)]
         code: Option<String>,
+        /// Download without asking.
+        #[arg(long, short)]
+        yes: bool,
         /// Reach the host at this address directly (local tests).
+        #[arg(long, hide = true)]
+        peer_address: Option<SocketAddr>,
+    },
+    /// A window for players: setup, pack code, check, enable, disable (double-clicking opens it on Windows).
+    Gui,
+    /// List what your game lacks for a pack, downloading nothing. Without a code: the last one.
+    Check {
+        #[arg(help = PACK)]
+        code: Option<String>,
         #[arg(long, hide = true)]
         peer_address: Option<SocketAddr>,
     },
@@ -236,33 +253,154 @@ fn ready(interactive: bool) -> Result<Settings> {
     Ok(s)
 }
 
-/// Syncs the given pack, or without one this machine's published pack (host) or the last one.
-fn do_sync(
+/// Where a pack comes from: a code (given or the last one), or this machine's published pack (host).
+enum Chosen {
+    Code(String, Pack),
+    Own(Published),
+}
+
+fn choose(
     source: Option<String>,
     direct: Option<SocketAddr>,
-    g: &Game,
     st: &Store,
-) -> Result<Value> {
-    clean_game(g)?;
-    let net = net()?;
+    net: &Net,
+) -> Result<Chosen> {
     let source = source.filter(|s| !s.trim().is_empty());
-    let remembered = st.root.join("source.txt");
-    let source = match source.or_else(|| std::fs::read_to_string(&remembered).ok()) {
-        Some(s) => sync::source(&s),
-        None => {
-            if let Some(own) = Host::open()?.published()? {
-                return sync::sync(&own.pack, g, st, &net, None, Some(&own));
-            }
-            return Err(Error::new(
+    match source.or_else(|| std::fs::read_to_string(st.root.join("source.txt")).ok()) {
+        Some(s) => {
+            let source = sync::source(&s);
+            let pack = sync::fetch_pack(&source, net, direct)?;
+            Ok(Chosen::Code(source, pack))
+        }
+        None => match Host::open()?.published()? {
+            Some(own) => Ok(Chosen::Own(own)),
+            None => Err(Error::new(
                 "pack_required",
                 "Which pack? `sms enable <code>` with the code your host gave you.",
+            )),
+        },
+    }
+}
+
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.0} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
+    }
+}
+
+/// What is out of sync, for a person to read.
+fn describe(c: &sync::Check) -> String {
+    let mut out = format!("Pack \"{}\":\n", c.pack);
+    if !c.needs_download() {
+        out.push_str("  Everything is synced.\n");
+    }
+    if !c.mods.is_empty() {
+        let files: usize = c.mods.iter().map(|m| m.files).sum();
+        out.push_str(&format!("\nMods to get ({files} files):\n"));
+        let width = c.mods.iter().map(|m| m.name.len()).max().unwrap_or(0);
+        for m in &c.mods {
+            let from = match m.from {
+                "nexus" => "Nexus",
+                "download" => "download",
+                _ => "host",
+            };
+            out.push_str(&format!(
+                "  {:width$}  {:>5} files  {:>8}  {from}\n",
+                m.name,
+                m.files,
+                size(m.bytes)
             ));
         }
+    }
+    if !c.game_files.is_empty() {
+        out.push_str("\nGame files from the host (yours come back when you disable the pack):\n");
+        let width = c.game_files.iter().map(|f| f.path.len()).max().unwrap_or(0);
+        for f in &c.game_files {
+            out.push_str(&format!(
+                "  {:width$}  {:9}  {:>8}\n",
+                f.path,
+                f.state,
+                size(f.bytes)
+            ));
+        }
+    }
+    if !c.set_aside.is_empty() {
+        let plugins: Vec<&str> = c
+            .set_aside
+            .iter()
+            .map(|p| p.rsplit('/').next().unwrap_or(p))
+            .filter(|n| {
+                let n = n.to_ascii_lowercase();
+                n.ends_with(".esp") || n.ends_with(".esm") || n.ends_with(".esl")
+            })
+            .collect();
+        out.push_str(&format!(
+            "\nYour own Data files set aside while the pack is on: {}",
+            c.set_aside.len()
+        ));
+        if !plugins.is_empty() {
+            out.push_str(&format!(" (plugins: {})", plugins.join(", ")));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Yes unless the person answers no.
+fn confirm(question: &str) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Err(Error::new(
+            "confirm_required",
+            "Nobody to ask: pass --yes to download without asking.",
+        ));
+    }
+    eprint!("{question} [Y/n] ");
+    io::Write::flush(&mut io::stderr())?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(!line.trim().to_ascii_lowercase().starts_with('n'))
+}
+
+/// What the game lacks for a pack, downloading nothing.
+fn check_pack(
+    code: Option<String>,
+    direct: Option<SocketAddr>,
+    s: &Settings,
+) -> Result<sync::Check> {
+    let (g, st) = (game(s)?, store(s)?);
+    let pack = match choose(code, direct, &st, &net()?)? {
+        Chosen::Code(_, pack) => pack,
+        Chosen::Own(own) => own.pack,
     };
-    let pack = sync::fetch_pack(&source, &net, direct)?;
-    let result = sync::sync(&pack, g, st, &net, direct, None)?;
-    files::write_atomic(&remembered, source.as_bytes())?;
-    Ok(result)
+    let mut c = sync::check(&pack, &g, &st)?;
+    if g.state() != deploy::State::Clean {
+        // Your own files are aside already; what downloads is still right.
+        c.set_aside.clear();
+    }
+    Ok(c)
+}
+
+fn check(
+    code: Option<String>,
+    direct: Option<SocketAddr>,
+    s: &Settings,
+    json_mode: bool,
+) -> Result<Value> {
+    let c = check_pack(code, direct, s)?;
+    if json_mode {
+        return Ok(serde_json::to_value(&c)?);
+    }
+    let mut out = describe(&c);
+    if c.needs_download() {
+        out.push_str(&format!(
+            "\nAbout {} to download: `sms enable` gets it.",
+            size(c.download_bytes)
+        ));
+    }
+    Ok(json!({ "note": out }))
 }
 
 fn do_load(g: &Game, st: &Store) -> Result<Value> {
@@ -278,10 +416,42 @@ fn do_load(g: &Game, st: &Store) -> Result<Value> {
 
 const PLAY: &str = "Start Skyrim from Steam. `sms disable` puts your game back as it was.";
 
-fn enable(code: Option<String>, direct: Option<SocketAddr>, s: &Settings) -> Result<Value> {
+/// The CLI's question before downloading: the list, then yes or no (JSON: the list as an event, yes).
+fn ask_cli(c: &sync::Check, yes: bool, json_mode: bool) -> Result<bool> {
+    if json_mode {
+        skyrim_mod_sync::event("out_of_sync", serde_json::to_value(c)?);
+        return Ok(true);
+    }
+    eprintln!("\n{}", describe(c));
+    Ok(!c.needs_download()
+        || yes
+        || confirm(&format!("Download about {}?", size(c.download_bytes)))?)
+}
+
+/// `ask` sees what is out of sync and says whether to download it.
+fn enable(
+    code: Option<String>,
+    direct: Option<SocketAddr>,
+    s: &Settings,
+    ask: &dyn Fn(&sync::Check) -> Result<bool>,
+) -> Result<Value> {
     let (g, st) = (game(s)?, store(s)?);
     launch::refuse_if_running()?;
-    let synced = do_sync(code, direct, &g, &st)?;
+    clean_game(&g)?;
+    let net = net()?;
+    let synced = match choose(code, direct, &st, &net)? {
+        Chosen::Own(own) => sync::sync(&own.pack, &g, &st, &net, None, Some(&own))?,
+        Chosen::Code(source, pack) => {
+            if !ask(&sync::check(&pack, &g, &st)?)? {
+                return Ok(
+                    json!({"state": "declined", "note": "Nothing downloaded; your game is unchanged."}),
+                );
+            }
+            let synced = sync::sync(&pack, &g, &st, &net, direct, None)?;
+            files::write_atomic(&st.root.join("source.txt"), source.as_bytes())?;
+            synced
+        }
+    };
     let loaded = do_load(&g, &st)?;
     Ok(json!({
         "state": "enabled",
@@ -303,7 +473,7 @@ fn guided(interactive: bool) -> Result<Value> {
     let s = ready(interactive)?;
     let last = std::fs::read_to_string(store(&s)?.root.join("source.txt")).ok();
     let code = config::ask("Pack code (paste it here)?", last.as_deref(), interactive)?;
-    enable(Some(code), None, &s)
+    enable(Some(code), None, &s, &|c| ask_cli(c, false, false))
 }
 
 /// The mod list `sms host` reads by default.
@@ -433,7 +603,17 @@ fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
             documents,
             key_stdin,
         } => setup(game, store, local, documents, key_stdin, interactive),
-        Command::Enable { code, peer_address } => enable(code, peer_address, &ready(interactive)?),
+        Command::Enable {
+            code,
+            yes,
+            peer_address,
+        } => enable(code, peer_address, &ready(interactive)?, &|c| {
+            ask_cli(c, yes, json_mode)
+        }),
+        Command::Gui => gui::run(),
+        Command::Check { code, peer_address } => {
+            check(code, peer_address, &ready(interactive)?, json_mode)
+        }
         Command::Disable => {
             let g = game(&Settings::load()?)?;
             launch::refuse_if_running()?;
@@ -511,9 +691,39 @@ fn pause() {
     }
 }
 
+/// Started from a file manager rather than a terminal: Windows gives the program a console of its own
+/// (closed here, the window replaces it); elsewhere there is no terminal at all.
+fn double_clicked() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+        let mut ids = [0u32; 2];
+        // SAFETY: the buffer holds the 2 entries passed as its length.
+        let own = unsafe { GetConsoleProcessList(ids.as_mut_ptr(), 2) } == 1;
+        if own {
+            // SAFETY: detaching from our own console; nothing holds its handles.
+            unsafe { FreeConsole() };
+        }
+        own
+    }
+    #[cfg(not(windows))]
+    {
+        !io::stdin().is_terminal()
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_mode = cli.json;
+    if cli.command.is_none() && !json_mode && double_clicked() {
+        return match gui::run() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {}", e.message);
+                ExitCode::from(2)
+            }
+        };
+    }
     let hold = cfg!(windows) && cli.command.is_none() && !json_mode;
     skyrim_mod_sync::JSON.store(json_mode, std::sync::atomic::Ordering::Relaxed);
     let _ = ctrlc::set_handler(|| {

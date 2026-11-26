@@ -11,6 +11,7 @@ use crate::{
     store::Store,
     Error, Result,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -54,6 +55,125 @@ pub fn fetch_pack(source: &str, net: &Net, direct: Option<SocketAddr>) -> Result
     Ok(pack)
 }
 
+/// One mod's files the store still needs.
+#[derive(Debug, Serialize)]
+pub struct ModChange {
+    pub name: String,
+    pub files: usize,
+    pub bytes: u64,
+    /// "nexus", "download" (a URL) or "host".
+    pub from: &'static str,
+}
+
+/// A licensed game file the host sends.
+#[derive(Debug, Serialize)]
+pub struct GameFile {
+    pub path: String,
+    pub bytes: u64,
+    /// "missing" or "different" (another version).
+    pub state: &'static str,
+}
+
+/// What a player's game and store lack for a pack: shown before anything downloads.
+#[derive(Debug, Serialize)]
+pub struct Check {
+    pub pack: String,
+    pub mods: Vec<ModChange>,
+    pub game_files: Vec<GameFile>,
+    /// About what downloads: whole archives not cached yet, and the host's files.
+    pub download_bytes: u64,
+    /// The player's own Data/ files moved aside while the pack is on.
+    pub set_aside: Vec<String>,
+}
+
+impl Check {
+    pub fn needs_download(&self) -> bool {
+        !self.mods.is_empty() || !self.game_files.is_empty()
+    }
+}
+
+fn differs(plan: &deploy::Plan) -> Result<()> {
+    match plan.differs.first() {
+        Some(p) => Err(Error::new("game_differs", format!("Your game's {p} differs from the host's: same Skyrim version and edition? Verify the game's files in Steam."))),
+        None => Ok(()),
+    }
+}
+
+/// Lists what is out of sync, downloading nothing.
+pub fn check(pack: &Pack, game: &Game, store: &Store) -> Result<Check> {
+    let plan = deploy::plan(pack, game, &mut store.hashes(), |e| {
+        store.has(&e.hash, e.size).then(|| store.object(&e.hash))
+    })?;
+    differs(&plan)?;
+    let changed: BTreeSet<String> = plan.changed.iter().map(|p| files::fold(p)).collect();
+    let mut mods: Vec<ModChange> = vec![];
+    let mut game_files = vec![];
+    let mut archives = BTreeSet::new();
+    let mut download_bytes = 0;
+    for e in &plan.missing {
+        let from = match &e.from {
+            From::Base => {
+                game_files.push(GameFile {
+                    path: e.path.clone(),
+                    bytes: e.size,
+                    state: if changed.contains(&files::fold(&e.path)) {
+                        "different"
+                    } else {
+                        "missing"
+                    },
+                });
+                download_bytes += e.size;
+                continue;
+            }
+            From::Host => {
+                download_bytes += e.size;
+                "host"
+            }
+            From::Archive { archive, .. } => match pack.archive(archive) {
+                Some(a) => {
+                    if archives.insert(a.hash.clone()) && !store.downloads().join(&a.hash).is_file()
+                    {
+                        download_bytes += a.size;
+                    }
+                    match a.origin {
+                        Origin::Nexus { .. } => "nexus",
+                        Origin::Url { .. } => "download",
+                    }
+                }
+                None => "host",
+            },
+        };
+        let name = e.r#mod.clone().unwrap_or_else(|| "(other)".into());
+        match mods.iter_mut().find(|m| m.name == name) {
+            Some(m) => {
+                m.files += 1;
+                m.bytes += e.size;
+            }
+            None => mods.push(ModChange {
+                name,
+                files: 1,
+                bytes: e.size,
+                from,
+            }),
+        }
+    }
+    let set_aside = plan
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            deploy::Op::Aside { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    Ok(Check {
+        pack: pack.name.clone(),
+        mods,
+        game_files,
+        download_bytes,
+        set_aside,
+    })
+}
+
 /// `own`: the host syncing its own pack, every file taken from this machine.
 pub fn sync(
     pack: &Pack,
@@ -68,9 +188,7 @@ pub fn sync(
     let plan = deploy::plan(pack, game, &mut cache, |e| {
         store.has(&e.hash, e.size).then(|| store.object(&e.hash))
     })?;
-    if let Some(p) = plan.differs.first() {
-        return Err(Error::new("game_differs", format!("Your game's {p} differs from the host's: same Skyrim version and edition? Verify the game's files in Steam.")));
-    }
+    differs(&plan)?;
     if let Some(own) = own {
         for e in &plan.missing {
             let path = own.file(&e.hash)?.ok_or_else(|| {

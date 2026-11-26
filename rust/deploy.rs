@@ -18,8 +18,10 @@ use std::{
 const DIR: &str = ".skyrim-mod-sync";
 const LAUNCHER: &str = "SkyrimSELauncher.exe";
 const LOADER: &str = "skse64_loader.exe";
-/// Files a mod may rewrite while the game runs: copied, never hardlinked.
-const COPY: [&str; 8] = ["ini", "json", "toml", "txt", "yaml", "yml", "xml", "cfg"];
+/// Files a mod or the game may rewrite: copied, never hardlinked (ccc: Skyrim.ccc).
+const COPY: [&str; 9] = [
+    "ini", "json", "toml", "txt", "yaml", "yml", "xml", "cfg", "ccc",
+];
 
 /// The folders a load touches.
 #[derive(Clone, Debug)]
@@ -64,10 +66,12 @@ pub enum State {
 #[derive(Debug, Default)]
 pub struct Plan {
     pub ops: Vec<Op>,
-    /// Pack files neither the game nor a source has.
+    /// Pack files neither the game nor a source has (licensed files `rules::host_sends` that the game lacks or has another version of).
     pub missing: Vec<Entry>,
-    /// Licensed files whose own copy differs (another Skyrim version or edition).
+    /// Other licensed files whose own copy differs (another Skyrim version or edition).
     pub differs: Vec<String>,
+    /// Pack paths the game has with other contents (the rest it lacks or already matches).
+    pub changed: Vec<String>,
 }
 
 impl Game {
@@ -130,11 +134,13 @@ pub fn plan(
     let mut places = vec![];
     for e in &pack.files {
         let key = fold(&e.path);
-        if same.get(key.as_str()) == Some(&true) {
-            continue;
+        match same.get(key.as_str()) {
+            Some(true) => continue,
+            Some(false) => plan.changed.push(e.path.clone()),
+            None => {}
         }
         match (&e.from, source(e)) {
-            (From::Base, _) => plan.differs.push(e.path.clone()),
+            (From::Base, _) if !rules::host_sends(&e.path) => plan.differs.push(e.path.clone()),
             (_, None) => plan.missing.push(e.clone()),
             (_, Some(src)) => places.push((e.path.clone(), src)),
         }
