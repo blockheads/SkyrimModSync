@@ -11,7 +11,7 @@ use skyrim_mod_sync::{
     net::Net,
     pack::Pack,
     peer::{self, Published},
-    steam,
+    size, steam,
     store::Store,
     sync, Error, Result,
 };
@@ -124,6 +124,18 @@ fn net() -> Result<Net> {
 }
 
 /// An enabled or half-enabled pack comes out first (the game must not be running).
+fn disable(s: &Settings) -> Result<Value> {
+    let g = game(s)?;
+    launch::refuse_if_running()?;
+    if g.state() == deploy::State::Clean {
+        return Ok(json!({"state": "disabled", "note": "No pack is on: your game is as it was."}));
+    }
+    deploy::unload(&g)?;
+    Ok(
+        json!({"state": "disabled", "note": "Your game is back as it was. Enable turns the pack on again."}),
+    )
+}
+
 fn clean_game(g: &Game) -> Result<()> {
     if g.state() != deploy::State::Clean {
         launch::refuse_if_running()?;
@@ -282,15 +294,6 @@ fn choose(
     }
 }
 
-fn size(bytes: u64) -> String {
-    match bytes {
-        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
-        b if b >= 1 << 20 => format!("{:.0} MB", b as f64 / (1u64 << 20) as f64),
-        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
-        b => format!("{b} B"),
-    }
-}
-
 /// What is out of sync, for a person to read.
 fn describe(c: &sync::Check) -> String {
     let mut out = format!("Pack \"{}\":\n", c.pack);
@@ -393,14 +396,16 @@ fn check(
     if json_mode {
         return Ok(serde_json::to_value(&c)?);
     }
-    let mut out = describe(&c);
+    Ok(json!({ "note": check_text(&c) }))
+}
+
+/// The check's list and what it comes to.
+fn check_text(c: &sync::Check) -> String {
+    let mut out = describe(c);
     if c.needs_download() {
-        out.push_str(&format!(
-            "\nAbout {} to download: `sms enable` gets it.",
-            size(c.download_bytes)
-        ));
+        out.push_str(&format!("\nAbout {} to download.", size(c.download_bytes)));
     }
-    Ok(json!({ "note": out }))
+    out
 }
 
 fn do_load(g: &Game, st: &Store) -> Result<Value> {
@@ -414,7 +419,7 @@ fn do_load(g: &Game, st: &Store) -> Result<Value> {
     deploy::load(g, &plan, &pack.name)
 }
 
-const PLAY: &str = "Start Skyrim from Steam. `sms disable` puts your game back as it was.";
+const PLAY: &str = "Start Skyrim from Steam. Disable puts your game back as it was.";
 
 /// The CLI's question before downloading: the list, then yes or no (JSON: the list as an event, yes).
 fn ask_cli(c: &sync::Check, yes: bool, json_mode: bool) -> Result<bool> {
@@ -457,7 +462,11 @@ fn enable(
         "state": "enabled",
         "pack": loaded["pack"],
         "downloaded_archives": synced["archives"],
-        "files_from_host": synced["host_files"],
+        "from_host": format!(
+            "{} files, {}",
+            synced["host_files"].as_u64().unwrap_or(0),
+            size(synced["host_bytes"].as_u64().unwrap_or(0))
+        ),
         "note": PLAY
     }))
 }
@@ -614,14 +623,7 @@ fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
         Command::Check { code, peer_address } => {
             check(code, peer_address, &ready(interactive)?, json_mode)
         }
-        Command::Disable => {
-            let g = game(&Settings::load()?)?;
-            launch::refuse_if_running()?;
-            let r = deploy::unload(&g)?;
-            Ok(
-                json!({"state": "disabled", "restored": r["restored"], "note": "Your game is back as it was. `sms enable` turns the pack on again."}),
-            )
-        }
+        Command::Disable => disable(&Settings::load()?),
         Command::Status => status(),
         Command::Clean => {
             let freed = store(&Settings::load()?)?.clean()?;
@@ -642,6 +644,17 @@ fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
 }
 
 /// Plain-text output: one `key: value` line per field, lists indented.
+/// A command's result for people: its fields, then its note.
+fn result_text(mut v: Value) -> String {
+    let note = v.as_object_mut().and_then(|m| m.remove("note"));
+    let mut out = String::new();
+    human(&v, 0, &mut out);
+    if let Some(Value::String(n)) = note {
+        out.push_str(&format!("\n{n}\n"));
+    }
+    out
+}
+
 fn human(v: &Value, indent: usize, out: &mut String) {
     let pad = " ".repeat(indent);
     match v {
@@ -734,14 +747,7 @@ fn main() -> ExitCode {
             if json_mode {
                 println!("{v}");
             } else {
-                let mut v = v;
-                let note = v.as_object_mut().and_then(|m| m.remove("note"));
-                let mut out = String::new();
-                human(&v, 0, &mut out);
-                if let Some(Value::String(n)) = note {
-                    out.push_str(&format!("\n{n}\n"));
-                }
-                print!("{out}");
+                print!("{}", result_text(v));
             }
             ExitCode::SUCCESS
         }

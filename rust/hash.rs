@@ -87,7 +87,14 @@ impl Cache {
         let known: Vec<Option<(u64, String)>> = (0..paths.len()).map(fresh).collect();
         let missing: Vec<usize> = (0..paths.len()).filter(|i| known[*i].is_none()).collect();
         if missing.len() > 50 {
-            crate::event("hashing", serde_json::json!({"files": missing.len()}));
+            crate::say(
+                "hashing",
+                &format!(
+                    "Reading {} files to compare them (only the first time)",
+                    missing.len()
+                ),
+                serde_json::json!({"files": missing.len()}),
+            );
         }
         let hashed = missing
             .par_iter()

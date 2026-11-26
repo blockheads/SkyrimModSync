@@ -307,9 +307,13 @@ impl Host {
         let (path, name) = match &origin {
             Origin::Nexus { game, r#mod, file } => match net.nexus_link(game, *r#mod, *file) {
                 Ok(url) => {
-                    crate::event("downloading", json!({"mod": m.name}));
+                    crate::say(
+                        "downloading",
+                        &format!("Downloading {}", m.name),
+                        json!({"mod": m.name}),
+                    );
                     (
-                        net.download(&url, &self.downloads(), None)?,
+                        net.download(&url, &self.downloads(), None, None)?,
                         file_name(&url),
                     )
                 }
@@ -329,8 +333,15 @@ impl Host {
                 Err(e) => return Err(e),
             },
             Origin::Url { url } => {
-                crate::event("downloading", json!({"mod": m.name}));
-                (net.download(url, &self.downloads(), None)?, file_name(url))
+                crate::say(
+                    "downloading",
+                    &format!("Downloading {}", m.name),
+                    json!({"mod": m.name}),
+                );
+                (
+                    net.download(url, &self.downloads(), None, None)?,
+                    file_name(url),
+                )
             }
         };
         known.insert(

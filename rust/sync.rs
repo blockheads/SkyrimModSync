@@ -39,6 +39,20 @@ pub fn source(input: &str) -> String {
 /// Fetches a pack from wherever `source` names.
 pub fn fetch_pack(source: &str, net: &Net, direct: Option<SocketAddr>) -> Result<Pack> {
     let source = &self::source(source);
+    let from = if let Some(id) = source.strip_prefix("gist:") {
+        format!("gist {id}")
+    } else if let Some(repo) = source.strip_prefix("github:") {
+        format!("the {repo} release")
+    } else if source.contains("://") || Path::new(source).is_file() {
+        source.clone()
+    } else {
+        "the host".into()
+    };
+    crate::say(
+        "fetching_pack",
+        &format!("Getting the pack from {from}..."),
+        json!({"source": source}),
+    );
     let bytes = if let Some(id) = source.strip_prefix("gist:") {
         net.gist_file(id, "pack.json")?
     } else if let Some(repo) = source.strip_prefix("github:") {
@@ -52,7 +66,29 @@ pub fn fetch_pack(source: &str, net: &Net, direct: Option<SocketAddr>) -> Result
     };
     let pack: Pack = serde_json::from_slice(&bytes)?;
     pack.validate()?;
+    said_pack(&pack);
     Ok(pack)
+}
+
+fn said_pack(pack: &Pack) {
+    crate::say(
+        "pack",
+        &format!(
+            "Pack \"{}\": {} files, {} plugins.",
+            pack.name,
+            pack.files.len(),
+            pack.plugins.len()
+        ),
+        json!({"pack": pack.name, "files": pack.files.len()}),
+    );
+}
+
+fn comparing() {
+    crate::say(
+        "comparing",
+        "Comparing your game and downloads with the pack...",
+        json!({}),
+    );
 }
 
 /// One mod's files the store still needs.
@@ -101,6 +137,7 @@ fn differs(plan: &deploy::Plan) -> Result<()> {
 
 /// Lists what is out of sync, downloading nothing.
 pub fn check(pack: &Pack, game: &Game, store: &Store) -> Result<Check> {
+    comparing();
     let plan = deploy::plan(pack, game, &mut store.hashes(), |e| {
         store.has(&e.hash, e.size).then(|| store.object(&e.hash))
     })?;
@@ -184,6 +221,7 @@ pub fn sync(
     own: Option<&Published>,
 ) -> Result<Value> {
     let _lock = files::Lock::take(&store.root.join("lock"))?;
+    comparing();
     let mut cache = store.hashes();
     let plan = deploy::plan(pack, game, &mut cache, |e| {
         store.has(&e.hash, e.size).then(|| store.object(&e.hash))
@@ -216,12 +254,18 @@ pub fn sync(
         .into_iter()
         .filter_map(|(h, es)| pack.archive(h).map(|a| (a, es)))
         .collect();
+    let to_download: u64 = jobs
+        .iter()
+        .filter(|(a, _)| !store.downloads().join(&a.hash).is_file())
+        .map(|(a, _)| a.size)
+        .sum();
+    let meter = (to_download > 0).then(|| crate::Meter::new("Downloading mods", to_download));
     let mut failed = vec![];
     for chunk in jobs.chunks(DOWNLOADS) {
         let results: Vec<Result<()>> = std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|(a, es)| s.spawn(|| fetch_archive(a, es, store, net)))
+                .map(|(a, es)| s.spawn(|| fetch_archive(a, es, store, net, meter.as_ref())))
                 .collect();
             handles
                 .into_iter()
@@ -233,8 +277,9 @@ pub fn sync(
         });
         for ((a, es), r) in chunk.iter().zip(results) {
             if let Err(e) = r {
-                crate::event(
+                crate::say(
                     "archive_from_host",
+                    &format!("{}: {} The host sends it instead.", a.name, e.message),
                     json!({"archive": a.name, "why": e.message}),
                 );
                 failed.push(a.name.clone());
@@ -242,15 +287,13 @@ pub fn sync(
             }
         }
     }
+    if let Some(m) = &meter {
+        m.finish();
+    }
     let wanted: BTreeSet<(String, u64)> =
         from_host.iter().map(|e| (e.hash.clone(), e.size)).collect();
     let wanted: Vec<(String, u64)> = wanted.into_iter().collect();
-    if !wanted.is_empty() {
-        crate::event(
-            "from_host",
-            json!({"files": wanted.len(), "note": "the host needs `sms host` running"}),
-        );
-    }
+    let host_bytes: u64 = wanted.iter().map(|w| w.1).sum();
     peer::fetch_files(&pack.host, direct, store, &wanted)?;
     store.set_pack(pack)?;
     Ok(json!({
@@ -260,22 +303,36 @@ pub fn sync(
         "archives": jobs.len() - failed.len(),
         "archives_from_host": failed,
         "host_files": wanted.len(),
-        "host_bytes": wanted.iter().map(|w| w.1).sum::<u64>(),
+        "host_bytes": host_bytes,
     }))
 }
 
 /// One archive: from the store's downloads, else downloaded; the needed members into the store.
-fn fetch_archive(a: &Archive, entries: &[&Entry], store: &Store, net: &Net) -> Result<()> {
+fn fetch_archive(
+    a: &Archive,
+    entries: &[&Entry],
+    store: &Store,
+    net: &Net,
+    meter: Option<&crate::Meter>,
+) -> Result<()> {
     let cached: PathBuf = store.downloads().join(&a.hash);
     let path = if cached.is_file() {
         cached
     } else {
-        let url = match &a.origin {
-            Origin::Url { url } => url.clone(),
-            Origin::Nexus { game, r#mod, file } => net.nexus_link(game, *r#mod, *file)?,
+        let (url, from) = match &a.origin {
+            Origin::Url { url } => (url.clone(), "its link"),
+            Origin::Nexus { game, r#mod, file } => (net.nexus_link(game, *r#mod, *file)?, "Nexus"),
         };
-        crate::event("downloading", json!({"archive": a.name, "size": a.size}));
-        net.download(&url, &store.downloads(), Some((a.size, &a.hash)))?
+        crate::say(
+            "downloading",
+            &format!(
+                "Downloading {} ({}) from {from}",
+                a.name,
+                crate::size(a.size)
+            ),
+            json!({"archive": a.name, "size": a.size}),
+        );
+        net.download(&url, &store.downloads(), Some((a.size, &a.hash)), meter)?
     };
     let members: BTreeMap<String, &str> = entries
         .iter()

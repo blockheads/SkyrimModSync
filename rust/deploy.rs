@@ -294,6 +294,23 @@ pub fn load(game: &Game, plan: &Plan, name: &str) -> Result<Value> {
             format!("Your game's {p} differs from the host's: same Skyrim version and edition?"),
         ));
     }
+    let count = |f: fn(&Op) -> bool| plan.ops.iter().filter(|o| f(o)).count();
+    let (places, asides) = (
+        count(|o| matches!(o, Op::Place { .. })),
+        count(|o| matches!(o, Op::Aside { .. })),
+    );
+    let mut steps = vec![format!("putting {places} files into the game")];
+    if asides > 0 {
+        steps.push(format!("setting {asides} of yours aside"));
+    }
+    if plan.ops.iter().any(|o| matches!(o, Op::User { .. })) {
+        steps.push("writing the load order and INI settings".into());
+    }
+    crate::say(
+        "enabling",
+        &format!("Enabling \"{name}\": {}...", steps.join(", ")),
+        json!({"place": places, "aside": asides}),
+    );
     files::write_json(&game.dir().join("journal.json"), &plan.ops)?;
     let (mut placed, mut aside) = (0, 0);
     for (i, op) in plan.ops.iter().enumerate() {
@@ -339,6 +356,20 @@ pub fn unload(game: &Game) -> Result<Value> {
         return Ok(json!({"state": "clean"}));
     }
     let ops: Vec<Op> = files::read_json(&journal)?;
+    let back = ops
+        .iter()
+        .filter(|o| matches!(o, Op::Aside { .. } | Op::Place { original: true, .. }))
+        .count();
+    let name = fs::read_to_string(game.dir().join("loaded"))
+        .map(|n| format!(" \"{n}\""))
+        .unwrap_or_else(|_| " an enable that was cut short".into());
+    crate::say(
+        "disabling",
+        &format!(
+            "Taking out{name}: removing its files, putting back {back} of yours and your load order and INI settings..."
+        ),
+        json!({"restore": back}),
+    );
     for (i, op) in ops.iter().enumerate().rev() {
         match op {
             Op::Place { path, original, .. } => {

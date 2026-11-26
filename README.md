@@ -8,17 +8,18 @@ turn it off afterwards to get their own game back.
 1. Download `sms` from the [latest release](https://github.com/blockheads/SkyrimModSync/releases/latest)
    (Windows: `sms-windows-x86_64.exe`; Linux: `sms-linux-x86_64`, then `chmod +x` it) and put it in your
    Skyrim folder (the one with `SkyrimSE.exe`).
-2. Double-click it: a window opens. Check the folders, add your Nexus API key if you have one, paste the
-   pack code your host gave you and press **Check**.
+2. Double-click it: a window opens. Under **Setup**, check the folders and add your Nexus API key if you
+   have one. Paste the pack code your host gave you and press **Check**.
 3. It lists what your game lacks (mods, game files from the host, your own mods it sets aside while the
-   pack is on). **Download and enable** gets it and turns the pack on.
+   pack is on). **Download and enable** gets it and turns the pack on, saying each step as it goes
+   (downloads show their speed and time left; **Cancel** stops, keeping what finished).
 4. Start Skyrim from Steam.
 
 When you're done, **Disable** (or `sms disable`) puts your game back as it was. Open it again and press
 Check to get the host's newest pack.
 
-From a terminal, `sms` asks the same questions as text: it lists what is out of sync and asks before
-downloading (`sms enable <code>`; `--yes` skips the question). `sms gui` opens the window on any system.
+From a terminal, `sms` asks the same questions as text and prints the same lines as the window: it lists
+what is out of sync and asks before downloading (`sms enable <code>`; `--yes` skips the question). `sms gui` opens the window on any system.
 
 A Premium Nexus key downloads Nexus mods from Nexus; without one, mods come from the host, who must have
 `sms host` running while you sync.

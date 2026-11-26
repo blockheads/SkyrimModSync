@@ -20,8 +20,10 @@ Decisions (2026-11-25):
 - **Nexus only through the user's own API key** (Premium downloads; `sms setup` asks; without Premium the host saves
   archives by hand into `downloads/`, and players get the files from the host).
 - **A simple window for players** (v0.8, egui): double-clicking opens it on Windows (the console it
-  started with is closed), `sms gui` anywhere; setup fields, pack code, Check (the out-of-sync list), Download
-  and enable, Disable. Hosts and scripts use the CLI, `--json` everywhere. Linux and Windows releases.
+  started with is closed), `sms gui` anywhere; a Setup section (folders, Nexus key), pack code, Check (the
+  out-of-sync list), Download and enable, Disable, Cancel while busy. It shows the same lines the terminal
+  prints (each step, download progress with speed and time left, the result), one for one. Hosts and
+  scripts use the CLI, `--json` everywhere. Linux and Windows releases.
 - **General**: codes and links travel between friends; no catalogue, no mod content shipped.
 - **Simple and fast** (v0.5): one hash (BLAKE3, parallel), no signing layer (iroh authenticates the host), the host
   serves files from where they are.

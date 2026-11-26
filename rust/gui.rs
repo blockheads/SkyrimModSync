@@ -1,25 +1,26 @@
-//! The players' window: the same steps as the double-click text flow (setup, pack code, what is out of
-//! sync, enable, disable), each run on a worker thread. Hosts use the command line.
-use crate::{check_pack, describe, enable, game, setup, size};
+//! The players' window: the same steps as the terminal (setup, pack code, check, enable, disable), each
+//! run on a worker thread, showing the same lines the terminal prints. Hosts use the command line.
+use crate::{check_pack, check_text, disable, enable, game, result_text, setup};
 use eframe::egui;
 use skyrim_mod_sync::{
     config::{self, Settings},
-    deploy, launch, steam, Result,
+    deploy, size, steam, Result, CANCELLED,
 };
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 
 /// What the worker threads report back.
 #[derive(Default)]
 struct Shared {
     busy: Option<&'static str>,
-    /// What is out of sync, as the CLI lists it.
-    list: String,
     /// The enable button's label once a check found something (or nothing) to get.
     enable: Option<String>,
+    /// What the terminal would print for the step under way.
     log: Vec<String>,
+    /// The download under way: its line and how far along.
+    progress: Option<(String, f32)>,
     error: Option<String>,
     status: String,
     /// A pack is in the game (Disable has something to do).
@@ -103,6 +104,11 @@ impl App {
             sh.log.drain(..excess);
             repaint.request_repaint();
         });
+        let (sink, repaint) = (shared.clone(), ctx.clone());
+        skyrim_mod_sync::set_progress_sink(move |text, part| {
+            sink.lock().unwrap().progress = Some((text.to_owned(), part));
+            repaint.request_repaint();
+        });
         let show = |p: Option<PathBuf>| p.map(|p| p.display().to_string()).unwrap_or_default();
         Self {
             game: show(game),
@@ -125,8 +131,10 @@ impl App {
             let mut sh = self.shared.lock().unwrap();
             sh.busy = Some(busy);
             sh.error = None;
+            sh.progress = None;
             sh.log.clear();
         }
+        CANCELLED.store(false, Ordering::Relaxed);
         let path = |s: &str| Some(s.trim()).filter(|s| !s.is_empty()).map(PathBuf::from);
         let (game, store, key) = (
             path(&self.game),
@@ -157,8 +165,9 @@ impl App {
             })();
             let mut sh = shared.lock().unwrap();
             sh.busy = None;
+            sh.progress = None;
             if let Err(e) = result {
-                sh.error = Some(e.message);
+                sh.error = Some(format!("error: {}", e.message));
             }
             ctx.request_repaint();
         });
@@ -166,10 +175,10 @@ impl App {
 
     fn check(&self, ctx: &egui::Context) {
         let code = self.code.trim().to_owned();
-        self.start(ctx, "Checking…", move |s, shared| {
+        self.start(ctx, "Checking...", move |s, shared| {
             let c = check_pack(Some(code), None, s)?;
             let mut sh = shared.lock().unwrap();
-            sh.list = describe(&c);
+            sh.log.extend(check_text(&c).lines().map(str::to_owned));
             sh.enable = Some(if c.needs_download() {
                 format!("Download about {} and enable", size(c.download_bytes))
             } else {
@@ -181,22 +190,22 @@ impl App {
 
     fn enable(&self, ctx: &egui::Context) {
         let code = self.code.trim().to_owned();
-        self.start(ctx, "Downloading and enabling…", move |s, shared| {
+        self.start(ctx, "Downloading and enabling...", move |s, shared| {
             // The person saw the list and pressed the button: that is the yes.
-            enable(Some(code), None, s, &|_| Ok(true))?;
+            let done = enable(Some(code), None, s, &|_| Ok(true))?;
             let mut sh = shared.lock().unwrap();
-            sh.list.clear();
+            sh.log.extend(result_text(done).lines().map(str::to_owned));
             sh.enable = None;
             Ok(())
         });
     }
 
     fn disable(&self, ctx: &egui::Context) {
-        self.start(ctx, "Disabling…", |s, shared| {
-            let g = game(s)?;
-            launch::refuse_if_running()?;
-            deploy::unload(&g)?;
-            shared.lock().unwrap().enable = None;
+        self.start(ctx, "Disabling...", |s, shared| {
+            let done = disable(s)?;
+            let mut sh = shared.lock().unwrap();
+            sh.log.extend(result_text(done).lines().map(str::to_owned));
+            sh.enable = None;
             Ok(())
         });
     }
@@ -204,52 +213,57 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (busy, list, enable_label, log, error, status, enabled) = {
+        let (busy, enable_label, log, error, status, enabled, progress) = {
             let sh = self.shared.lock().unwrap();
             (
                 sh.busy,
-                sh.list.clone(),
                 sh.enable.clone(),
                 sh.log.clone(),
                 sh.error.clone(),
                 sh.status.clone(),
                 sh.enabled,
+                sh.progress.clone(),
             )
         };
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SkyrimModSync");
             ui.add_space(6.0);
-            let before = self.code.clone();
-            egui::Grid::new("fields")
-                .num_columns(2)
-                .spacing([10.0, 6.0])
+            fn wide(text: &mut String) -> egui::TextEdit<'_> {
+                egui::TextEdit::singleline(text).desired_width(f32::INFINITY)
+            }
+            let set_up = !self.game.trim().is_empty() && !self.store.trim().is_empty();
+            egui::CollapsingHeader::new("Setup")
+                .default_open(!set_up)
                 .show(ui, |ui| {
-                    fn wide(text: &mut String) -> egui::TextEdit<'_> {
-                        egui::TextEdit::singleline(text).desired_width(f32::INFINITY)
-                    }
-                    ui.label("Skyrim folder");
-                    ui.add(wide(&mut self.game).hint_text("the folder with SkyrimSE.exe"));
-                    ui.end_row();
-                    ui.label("Mods folder");
-                    ui.add(wide(&mut self.store).hint_text("on the same drive as Skyrim"));
-                    ui.end_row();
-                    ui.label("Nexus API key");
-                    let hint = if self.key_saved {
-                        "saved (type to replace)"
-                    } else {
-                        "optional: Premium downloads from Nexus"
-                    };
-                    ui.add(wide(&mut self.key).password(true).hint_text(hint));
-                    ui.end_row();
-                    ui.label("Pack code");
-                    ui.add(wide(&mut self.code).hint_text("paste the code your host gave you"));
-                    ui.end_row();
+                    egui::Grid::new("setup")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Skyrim folder");
+                            ui.add(wide(&mut self.game).hint_text("the folder with SkyrimSE.exe"));
+                            ui.end_row();
+                            ui.label("Mods folder");
+                            ui.add(wide(&mut self.store).hint_text("on the same drive as Skyrim"));
+                            ui.end_row();
+                            ui.label("Nexus API key");
+                            let hint = if self.key_saved {
+                                "saved (type to replace)"
+                            } else {
+                                "optional: Premium downloads from Nexus"
+                            };
+                            ui.add(wide(&mut self.key).password(true).hint_text(hint));
+                            ui.end_row();
+                        });
                 });
+            ui.add_space(6.0);
+            let before = self.code.clone();
+            ui.horizontal(|ui| {
+                ui.label("Pack code");
+                ui.add(wide(&mut self.code).hint_text("paste the code your host gave you"));
+            });
             if self.code != before {
                 // Another pack: check it again before enabling.
-                let mut sh = self.shared.lock().unwrap();
-                sh.enable = None;
-                sh.list.clear();
+                self.shared.lock().unwrap().enable = None;
             }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -275,26 +289,29 @@ impl eframe::App for App {
                 if let Some(text) = busy {
                     ui.spinner();
                     ui.label(text);
+                    if ui.button("Cancel").clicked() {
+                        CANCELLED.store(true, Ordering::Relaxed);
+                    }
                 }
             });
+            if let Some((text, part)) = &progress {
+                ui.add(egui::ProgressBar::new(*part).text(text));
+            }
             ui.add_space(4.0);
             ui.label(&status);
-            if let Some(e) = &error {
-                ui.colored_label(ui.visuals().error_fg_color, e);
-            }
             ui.separator();
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if list.is_empty() && log.is_empty() {
+                    if log.is_empty() && error.is_none() {
                         ui.weak("Check lists what your game lacks for the pack before anything downloads.");
-                    }
-                    if !list.is_empty() {
-                        ui.monospace(&list);
                     }
                     for line in &log {
                         ui.monospace(line);
+                    }
+                    if let Some(e) = &error {
+                        ui.colored_label(ui.visuals().error_fg_color, egui::RichText::new(e).monospace());
                     }
                 });
         });

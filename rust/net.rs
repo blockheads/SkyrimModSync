@@ -43,7 +43,13 @@ impl Net {
     }
 
     /// `url` saved in `dir` as its BLAKE3; with `expect` (size, hash) anything else is refused.
-    pub fn download(&self, url: &str, dir: &Path, expect: Option<(u64, &str)>) -> Result<PathBuf> {
+    pub fn download(
+        &self,
+        url: &str,
+        dir: &Path,
+        expect: Option<(u64, &str)>,
+        meter: Option<&crate::Meter>,
+    ) -> Result<PathBuf> {
         fs::create_dir_all(dir)?;
         if let Some((_, h)) = expect {
             if dir.join(h).is_file() {
@@ -64,6 +70,9 @@ impl Net {
                 break;
             }
             std::io::Write::write_all(&mut out, &buf[..n])?;
+            if let Some(m) = meter {
+                m.add(n as u64);
+            }
         }
         let (size, h) = (
             out.hasher.count(),

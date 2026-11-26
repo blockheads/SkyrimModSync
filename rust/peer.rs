@@ -12,7 +12,10 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -91,6 +94,13 @@ pub fn secret(path: &Path) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&key))
 }
 
+/// What one friend's connection took.
+#[derive(Default)]
+struct Sent {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
 #[derive(Clone, Debug)]
 struct Handler(Arc<(Vec<u8>, Published)>);
 
@@ -99,6 +109,7 @@ impl Handler {
         &self,
         mut send: iroh::endpoint::SendStream,
         mut recv: iroh::endpoint::RecvStream,
+        sent: &Sent,
     ) -> Result<()> {
         let request = recv.read_to_end(256).await.map_err(failure)?;
         let request = String::from_utf8_lossy(&request);
@@ -119,7 +130,15 @@ impl Handler {
                         let mut file = tokio::fs::File::open(path).await?;
                         file.seek(std::io::SeekFrom::Start(offset)).await?;
                         send.write_all(b"1").await.map_err(failure)?;
-                        tokio::io::copy(&mut file, &mut send).await?;
+                        if sent.files.fetch_add(1, Ordering::Relaxed) == 0 {
+                            crate::say(
+                                "sending",
+                                "A friend is getting files from you...",
+                                serde_json::json!({}),
+                            );
+                        }
+                        let n = tokio::io::copy(&mut file, &mut send).await?;
+                        sent.bytes.fetch_add(n, Ordering::Relaxed);
                     }
                     None => send.write_all(b"0").await.map_err(failure)?,
                 }
@@ -133,9 +152,21 @@ impl Handler {
 
 impl ProtocolHandler for Handler {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let sent = Arc::new(Sent::default());
+        let mut streams = tokio::task::JoinSet::new();
         while let Ok((send, recv)) = connection.accept_bi().await {
-            let me = self.clone();
-            tokio::spawn(async move { me.answer(send, recv).await });
+            let (me, sent) = (self.clone(), sent.clone());
+            streams.spawn(async move { me.answer(send, recv, &sent).await });
+        }
+        while streams.join_next().await.is_some() {}
+        let files = sent.files.load(Ordering::Relaxed);
+        if files > 0 {
+            let bytes = sent.bytes.load(Ordering::Relaxed);
+            crate::say(
+                "sent",
+                &format!("Sent a friend {files} files ({}).", crate::size(bytes)),
+                serde_json::json!({"files": files, "bytes": bytes}),
+            );
         }
         Ok(())
     }
@@ -225,16 +256,27 @@ pub fn fetch_files(
     if wanted.is_empty() {
         return Ok(());
     }
+    let total: u64 = wanted.iter().map(|w| w.1).sum();
+    crate::say(
+        "from_host",
+        &format!(
+            "Connecting to the host for {} files ({})...",
+            wanted.len(),
+            crate::size(total)
+        ),
+        serde_json::json!({"files": wanted.len(), "bytes": total}),
+    );
     runtime()?.block_on(async {
         let (endpoint, conn) = connect(code, direct).await?;
+        let meter = Arc::new(crate::Meter::new("From the host", total));
         let gate = Arc::new(tokio::sync::Semaphore::new(STREAMS));
         let mut jobs = tokio::task::JoinSet::new();
         for (hash, size) in wanted.iter().cloned() {
-            let (conn, gate) = (conn.clone(), gate.clone());
+            let (conn, gate, meter) = (conn.clone(), gate.clone(), meter.clone());
             let dest = store.object(&hash);
             jobs.spawn(async move {
                 let _turn = gate.acquire().await;
-                fetch_one(&conn, &hash, size, &dest).await
+                fetch_one(&conn, &hash, size, &dest, &meter).await
             });
         }
         let mut result = Ok(());
@@ -245,11 +287,25 @@ pub fn fetch_files(
         }
         conn.close(0u32.into(), b"done");
         endpoint.close().await;
+        if result.is_ok() {
+            meter.finish();
+            crate::say(
+                "from_host_done",
+                &format!("Got {} files from the host.", wanted.len()),
+                serde_json::json!({"files": wanted.len()}),
+            );
+        }
         result
     })
 }
 
-async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Result<()> {
+async fn fetch_one(
+    conn: &Connection,
+    hash: &str,
+    size: u64,
+    dest: &Path,
+    meter: &crate::Meter,
+) -> Result<()> {
     crate::check_cancel()?;
     tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
     let part = dest.with_extension("part");
@@ -261,6 +317,7 @@ async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Res
         }
         _ => 0,
     };
+    meter.add(have);
     let mut recv = ask(conn, &format!("file {hash} {have}")).await?;
     let mut flag = [0u8];
     recv.read_exact(&mut flag).await.map_err(failure)?;
@@ -285,8 +342,10 @@ async fn fetch_one(conn: &Connection, hash: &str, size: u64, dest: &Path) -> Res
         if n == 0 {
             break;
         }
+        crate::check_cancel()?;
         hasher.update(&buf[..n]);
         out.write_all(&buf[..n]).await?;
+        meter.add(n as u64);
     }
     out.sync_all().await?;
     drop(out); // Windows will not rename a file still open
