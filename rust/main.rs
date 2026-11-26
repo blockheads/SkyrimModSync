@@ -105,8 +105,22 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HostCommand {
-    /// Add a Nexus mod to a list from the link of one of its files.
-    Add { list: PathBuf, link: String },
+    /// Add a mod to the list: a Nexus file link, or a folder or archive on this PC (`add LIST SOURCE`
+    /// also works). Adding the same mod again replaces it; its plugins are added too.
+    Add {
+        #[arg(num_args = 1..=2, required = true, value_name = "SOURCE")]
+        args: Vec<String>,
+        /// The mod list (default: modlist.json in this folder).
+        #[arg(long)]
+        list: Option<PathBuf>,
+    },
+    /// Take a mod out of the list, with its plugins: its name, Nexus link or local path.
+    Remove {
+        what: String,
+        /// The mod list (default: modlist.json in this folder).
+        #[arg(long)]
+        list: Option<PathBuf>,
+    },
 }
 
 fn game(s: &Settings) -> Result<Game> {
@@ -497,9 +511,14 @@ fn default_list() -> Result<PathBuf> {
         .ok_or_else(|| {
             Error::new(
                 "list_required",
-                "No modlist.json here: name your mod list, or start one with `sms host add modlist.json <nexus file link>`.",
+                "No modlist.json here: name your mod list, or start one with `sms host add <nexus file link or mod folder/archive>`.",
             )
         })
+}
+
+/// The list `sms host add` writes to: the default one, or a new modlist.json here.
+fn add_list() -> Result<PathBuf> {
+    Ok(default_list().unwrap_or_else(|_| PathBuf::from("modlist.json")))
 }
 
 /// Saves the pack to this host's gist (a new one the first time); returns the gist id.
@@ -630,9 +649,20 @@ fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
             Ok(json!({"state": "cleaned", "freed_bytes": freed}))
         }
         Command::Host {
-            command: Some(HostCommand::Add { list, link }),
+            command: Some(HostCommand::Add { args, list }),
             ..
-        } => Host::open()?.add(&list, &link, &net()?),
+        } => {
+            let (list, source) = match &args[..] {
+                [list, source] => (PathBuf::from(list), source),
+                [source] => (list.map_or_else(add_list, Ok)?, source),
+                _ => unreachable!("clap takes one or two"),
+            };
+            Host::open()?.add(&list, source, &net()?)
+        }
+        Command::Host {
+            command: Some(HostCommand::Remove { what, list }),
+            ..
+        } => Host::open()?.remove(&list.map_or_else(default_list, Ok)?, &what, &net()?),
         Command::Host {
             list,
             output,

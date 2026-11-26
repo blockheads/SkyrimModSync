@@ -695,6 +695,52 @@ fn add_appends_a_nexus_mod_from_its_link() {
 }
 
 #[test]
+fn add_and_remove_take_a_mods_plugins_with_it() {
+    let w = world();
+    let list = w.root.join("new.json");
+    let net = w.net(Some("host"));
+    let link = "https://www.nexusmods.com/skyrimspecialedition/mods/100?tab=files&file_id=200";
+    // A Nexus mod (its archive is downloaded and listed), a folder next to the list, a RAR elsewhere.
+    assert_eq!(
+        w.host.add(&list, link, &net).unwrap()["plugins"][0],
+        "A.esp"
+    );
+    let folder = w.root.join("list/B");
+    let r = w.host.add(&list, folder.to_str().unwrap(), &net).unwrap();
+    assert_eq!(r["plugins"][0], "B.esp");
+    let rar = Path::new(env!("CARGO_MANIFEST_DIR")).join("rust/testdata/solid.rar");
+    let r = w.host.add(&list, rar.to_str().unwrap(), &net).unwrap();
+    assert_eq!(
+        (r["mod"].as_str(), r["plugins"].as_array().map(Vec::len)),
+        (Some("solid"), Some(0))
+    );
+    // The same mod again replaces its entry; a plugin already listed is not listed twice.
+    assert_eq!(w.host.add(&list, link, &net).unwrap()["state"], "updated");
+    let read = crate::list::ModList::read(&list).unwrap();
+    assert_eq!(read.mods.len(), 3);
+    assert_eq!(read.mods[1].local.as_deref(), Some("list/B")); // under the list's folder: relative
+    assert_eq!(read.plugins, ["A.esp", "B.esp"]);
+    // Removed by name (any case) or by its link, with its plugins.
+    assert_eq!(
+        w.host.remove(&list, "o", &net).unwrap_err().code,
+        "mod_ambiguous"
+    );
+    assert_eq!(
+        w.host.remove(&list, "mod a", &net).unwrap()["plugins"][0],
+        "A.esp"
+    );
+    w.host
+        .remove(&list, folder.to_str().unwrap(), &net)
+        .unwrap();
+    assert_eq!(
+        w.host.remove(&list, link, &net).unwrap_err().code,
+        "mod_not_found"
+    );
+    let read = crate::list::ModList::read(&list).unwrap();
+    assert_eq!((read.mods.len(), read.plugins.len()), (1, 0));
+}
+
+#[test]
 fn clean_keeps_only_what_the_pack_uses() {
     let w = world();
     w.publish();

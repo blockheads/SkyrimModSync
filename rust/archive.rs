@@ -1,5 +1,4 @@
-//! Mod archives (zip, 7z): which files they hold, by hash, and taking out the ones a pack needs.
-//! RAR is not supported: a mod installed from a RAR archive is sent by the host instead.
+//! Mod archives (zip, 7z, rar): which files they hold, by hash, and taking out the ones a pack needs.
 use crate::{files, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
@@ -16,6 +15,7 @@ pub struct Member {
 enum Kind {
     Zip,
     SevenZ,
+    Rar,
 }
 
 fn kind(path: &Path) -> Result<Kind> {
@@ -24,13 +24,10 @@ fn kind(path: &Path) -> Result<Kind> {
     match &magic[..n] {
         [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Ok(Kind::Zip),
         [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C] => Ok(Kind::SevenZ),
-        [b'R', b'a', b'r', b'!', ..] => Err(Error::new(
-            "unsupported_archive",
-            "RAR archives are not supported.",
-        )),
+        [b'R', b'a', b'r', b'!', ..] => Ok(Kind::Rar),
         _ => Err(Error::new(
             "unsupported_archive",
-            format!("Not a zip or 7z archive: {}", path.display()),
+            format!("Not a zip, 7z or rar archive: {}", path.display()),
         )),
     }
 }
@@ -45,6 +42,14 @@ fn normal(name: &str) -> String {
 fn sevenz_error(e: sevenz_rust2::Error) -> Error {
     Error::new("invalid_archive", e.to_string())
 }
+
+fn rar_error(path: &Path, e: unrar::error::UnrarError) -> Error {
+    Error::new("invalid_archive", format!("{}: {e}", path.display()))
+}
+
+/// RAR members bigger than this are unpacked to a temporary file instead of memory (unrar has no
+/// streaming reader).
+const RAR_IN_MEMORY: u64 = 256 << 20;
 
 /// Calls `each` with every file member and a reader over its bytes, in archive order.
 fn walk(path: &Path, mut each: impl FnMut(&str, u64, &mut dyn Read) -> Result<()>) -> Result<()> {
@@ -82,6 +87,34 @@ fn walk(path: &Path, mut each: impl FnMut(&str, u64, &mut dyn Read) -> Result<()
             })
             .map_err(sevenz_error)?;
             failure.map_or(Ok(()), Err)
+        }
+        Kind::Rar => {
+            let mut open = unrar::Archive::new(path)
+                .open_for_processing()
+                .map_err(|e| rar_error(path, e))?;
+            // Each entry is read (unpacked) or skipped; solid archives unpack skipped ones too.
+            while let Some(header) = open.read_header().map_err(|e| rar_error(path, e))? {
+                crate::check_cancel()?;
+                let entry = header.entry();
+                if !entry.is_file() {
+                    open = header.skip().map_err(|e| rar_error(path, e))?;
+                    continue;
+                }
+                let name = normal(&entry.filename.to_string_lossy());
+                let size = entry.unpacked_size;
+                if size <= RAR_IN_MEMORY {
+                    let (bytes, next) = header.read().map_err(|e| rar_error(path, e))?;
+                    each(&name, size, &mut bytes.as_slice())?;
+                    open = next;
+                } else {
+                    let tmp = tempfile::NamedTempFile::new()?;
+                    open = header
+                        .extract_to(tmp.path())
+                        .map_err(|e| rar_error(path, e))?;
+                    each(&name, size, &mut File::open(tmp.path())?)?;
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -194,10 +227,19 @@ mod tests {
         }
     }
     #[test]
-    fn rar_is_refused_by_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("a.rar");
-        std::fs::write(&p, b"Rar!\x1a\x07\x00").unwrap();
-        assert_eq!(members(&p).unwrap_err().code, "unsupported_archive");
+    fn lists_and_extracts_a_solid_rar() {
+        // rar a -ma5 -s: A.esp ("plugin"), textures/t.dds ("texture")
+        let rar = Path::new(env!("CARGO_MANIFEST_DIR")).join("rust/testdata/solid.rar");
+        let m = members(&rar).unwrap();
+        assert_eq!(m.len(), 2);
+        let t = m.iter().find(|m| m.name == "textures/t.dds").unwrap();
+        assert_eq!(t.hash, blake3::hash(b"texture").to_hex().to_string());
+        let mut got = vec![];
+        extract(&rar, &["A.ESP".to_owned()].into(), |_, r| {
+            r.read_to_end(&mut got)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, b"plugin");
     }
 }

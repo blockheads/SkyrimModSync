@@ -25,6 +25,9 @@ Decisions (2026-11-25):
   prints (each step, download progress with speed and time left, the result), one for one. Hosts and
   scripts use the CLI, `--json` everywhere. Linux and Windows releases.
 - **General**: codes and links travel between friends; no catalogue, no mod content shipped.
+- **RAR read in-process** (the `unrar` crate, RARLAB's unRAR source): Nexus mods shipped as .rar work like
+  zip/7z for everyone. unRAR's license allows extraction only and is not GPL-compatible as such; accepted
+  (2026-11-26) over host-only conversion with an external tool. Members over 256 MB unpack to a temp file.
 - **Simple and fast** (v0.5): one hash (BLAKE3, parallel), no signing layer (iroh authenticates the host), the host
   serves files from where they are.
 
@@ -50,7 +53,8 @@ mod = name + one source: nexus{mod, file} | url | github{repo, asset?} | local (
 install rule: root files → game root; Data/… → Data/; a mod with a Data/ folder installs
 only that and its root files (SKSE: skips src/); otherwise everything → Data/; fomod/ never
 later mods win conflicts; plugins = load order; ini = shared settings
-sms host add LIST <nexus file link> appends a Nexus mod
+sms host add SOURCE [--list] (Nexus file link | local folder/archive): appends, or replaces the same
+  mod; its Data/*.esp|esm|esl join plugins. sms host remove NAME|LINK|PATH: takes the mod and its plugins out
 ```
 
 ## 2. Publish (`host.rs`)
@@ -101,7 +105,7 @@ speed (size-optimized build, hashing/unpacking/crypto at full optimization).
 ## Later
 
 Converters into the mod list or straight into a pack (scanning an installed game folder against the downloaded
-archives, MO2, Vortex, Wabbajack), macOS (CrossOver), hosting from the window, RAR archives, peers sharing
+archives, MO2, Vortex, Wabbajack), macOS (CrossOver), hosting from the window, peers sharing
 files they already have.
 
 ## Not yet tested

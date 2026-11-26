@@ -46,7 +46,18 @@ Each mod comes from `nexus`, `url`, `github` (newest release) or `local`: a fold
 list or absolute, sent by the host over P2P. A `*` in a local name picks the newest match, so
 `"local": "/path/to/build/package/MyMod-*.zip"` shares your latest build with no release. Its
 files go into `Data/`; `folder` picks a folder inside the archive, `root` lists files that go next to
-`SkyrimSE.exe`. Later mods win conflicts. `sms host add modlist.json <nexus file link>` adds a Nexus mod.
+`SkyrimSE.exe`. Later mods win conflicts. Archives can be zip, 7z or rar.
+
+To change the list without editing it (the list in this folder, or `--list FILE`):
+
+```sh
+sms host add "https://www.nexusmods.com/skyrimspecialedition/mods/266?tab=files&file_id=800977"
+sms host add ~/mods/MyMod.zip        # or a folder; the host sends its files
+sms host remove "unofficial"         # by name (or part of it), Nexus link or path
+```
+
+`add` puts the mod's plugins at the end of `plugins` (the same mod again replaces its entry, for a new
+version); `remove` takes them out. Run `sms host` again to share the change.
 
 Then, in the list's folder:
 
