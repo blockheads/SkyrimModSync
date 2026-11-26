@@ -15,6 +15,10 @@ turn it off afterwards to get their own game back.
    (downloads show their speed and time left; **Cancel** stops, keeping what finished).
 4. Start Skyrim from Steam.
 
+**Send reports** sends your host the files their list names (a mod's exported logs or crash reports
+from the last week): the first press lists them, the second sends them, and your host accepts first
+(`sms send`, or `sms send FILE...` for files you choose).
+
 When you're done, **Disable** (or `sms disable`) puts your game back as it was. Open it again and press
 Check to get the host's newest pack.
 
@@ -71,8 +75,20 @@ Nexus can't, until Ctrl-C. The code stays the same when you change the list and 
 
 Without Nexus Premium, `sms host` lists the archives to save by hand into `downloads/` next to the list.
 
+To get friends' reports, name them in the list (`Documents/` is the game's Documents/My Games/Skyrim
+Special Edition, `Game/` the Skyrim folder; `*` in the file name):
+
+```json
+"reports": ["Documents/SkyrimCoop/SkyrimCoop-*.zip"]
+```
+
+When a friend sends some, `sms host` shows who and what and asks; a yes puts them in `received/<friend>/`
+next to the list. Nothing arrives without your yes.
+
 ## Good to know
 
+- sms checks for a newer release once a day and asks before updating (`sms update` any time;
+  `SMS_NO_UPDATE=1` turns the check off).
 - `sms check [code]` lists what is out of sync without downloading.
 - `sms status` shows what is set up and enabled; `sms clean` frees space from old versions.
 - Everyone needs the same Skyrim version and edition (Anniversary content included or not). Game `.bsa`

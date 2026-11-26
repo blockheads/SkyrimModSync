@@ -28,6 +28,10 @@ Decisions (2026-11-25):
 - **RAR read in-process** (the `unrar` crate, RARLAB's unRAR source): Nexus mods shipped as .rar work like
   zip/7z for everyone. unRAR's license allows extraction only and is not GPL-compatible as such; accepted
   (2026-11-26) over host-only conversion with an external tool. Members over 256 MB unpack to a temp file.
+- **Reports gated on both sides** (v0.10): friends see and confirm what they send; the host accepts each
+  offer at its terminal. Anyone with the pack code may offer; only a yes writes anything.
+- **Self-update** (v0.10): the newest GitHub release, checked once a day; asked first; the binary is
+  checked against the release's SHA256SUMS and swapped in place (Windows: the old one renamed aside).
 - **Simple and fast** (v0.5): one hash (BLAKE3, parallel), no signing layer (iroh authenticates the host), the host
   serves files from where they are.
 
@@ -76,6 +80,16 @@ one iroh connection, one stream per request, 8 at a time:
   "pack"                  → the pack JSON
   "file <hash> <offset>"  → '1' + bytes from the host's own file, or '0'
 friend writes <hash>.part, checks size and hash, renames into the store; a cut file resumes
+```
+
+Reports (`reports.rs`, v0.10), the other way, both sides asked:
+
+```
+friend: Send reports / sms send → the list's patterns, last week, newest 10 → hashed offer → asked
+  "offer\n" + JSON{from, files[name,size,hash]}  → host asks at its terminal (one at a time; 5 min,
+                                                     Ctrl-C or no terminal = no)
+  ← '0' | '1' + offsets (bytes the host has: resume; size = has it)
+  "put <i> <offset>\n" + bytes (only on the accepted connection) → received/<from>/<name>, hash-checked
 ```
 
 ## 4. Sync (`sync.rs`)

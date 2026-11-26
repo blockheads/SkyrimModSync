@@ -239,6 +239,9 @@ impl World {
     }
     /// Serves on a local port until the returned flag is set.
     fn serve(&self) -> (SocketAddr, Arc<AtomicBool>) {
+        self.serve_with(None)
+    }
+    fn serve_with(&self, inbox: Option<peer::Inbox>) -> (SocketAddr, Arc<AtomicBool>) {
         let addr: SocketAddr = UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -254,6 +257,7 @@ impl World {
             peer::serve(
                 key,
                 published,
+                inbox,
                 Some(addr),
                 |_| tx.send(()).unwrap(),
                 || flag.load(Ordering::Relaxed),
@@ -738,6 +742,53 @@ fn add_and_remove_take_a_mods_plugins_with_it() {
     );
     let read = crate::list::ModList::read(&list).unwrap();
     assert_eq!((read.mods.len(), read.plugins.len()), (1, 0));
+}
+
+#[test]
+fn reports_go_to_the_host_only_once_it_accepts() {
+    let w = world();
+    w.publish();
+    let received = w.root.join("received");
+    let answer = Arc::new(AtomicBool::new(false));
+    let asked = Arc::new(Mutex::new(vec![]));
+    let (a, log) = (answer.clone(), asked.clone());
+    let (addr, stop) = w.serve_with(Some(peer::Inbox {
+        dir: received.clone(),
+        ask: Box::new(move |offer| {
+            log.lock().unwrap().push(offer.describe());
+            a.load(Ordering::Relaxed)
+        }),
+    }));
+    let code = w.host.key().unwrap().public().to_string();
+    write(&w.root, "docs/SkyrimCoop/Report-1.zip", b"first report");
+    write(&w.root, "docs/SkyrimCoop/Report-2.zip", &vec![7u8; 3 << 20]);
+    let paths = crate::reports::pick(
+        &["Documents/SkyrimCoop/Report-*.zip".into()],
+        &w.root.join("docs"),
+        &w.friend.root,
+    );
+    let offer = crate::reports::offer(&paths).unwrap();
+    let from = received.join(&offer.from);
+    // Refused: nothing lands.
+    assert!(!peer::send_reports(&code, Some(addr), &offer, &paths, || {}).unwrap());
+    assert!(!from.exists());
+    // Accepted: both arrive whole, and the host saw who and what.
+    answer.store(true, Ordering::Relaxed);
+    assert!(peer::send_reports(&code, Some(addr), &offer, &paths, || {}).unwrap());
+    assert_eq!(
+        fs::read(from.join("Report-1.zip")).unwrap(),
+        b"first report"
+    );
+    assert_eq!(fs::read(from.join("Report-2.zip")).unwrap().len(), 3 << 20);
+    let seen = asked.lock().unwrap().clone();
+    assert!(
+        seen[1].contains(&offer.from) && seen[1].contains("Report-2.zip"),
+        "{seen:?}"
+    );
+    // Sent again: the host has them, nothing doubles.
+    assert!(peer::send_reports(&code, Some(addr), &offer, &paths, || {}).unwrap());
+    assert_eq!(fs::read_dir(&from).unwrap().count(), 2);
+    stop.store(true, Ordering::Relaxed);
 }
 
 #[test]

@@ -1,10 +1,15 @@
 //! The players' window: the same steps as the terminal (setup, pack code, check, enable, disable), each
 //! run on a worker thread, showing the same lines the terminal prints. Hosts use the command line.
-use crate::{check_pack, check_text, disable, enable, game, result_text, setup};
+use crate::{
+    check_pack, check_text, disable, enable, game, offer_text, report_offer, result_text,
+    send_offer, setup,
+};
 use eframe::egui;
 use skyrim_mod_sync::{
     config::{self, Settings},
-    deploy, size, steam, Result, CANCELLED,
+    deploy,
+    reports::Offer,
+    size, steam, update, Result, CANCELLED,
 };
 use std::{
     path::PathBuf,
@@ -25,6 +30,10 @@ struct Shared {
     status: String,
     /// A pack is in the game (Disable has something to do).
     enabled: bool,
+    /// Reports listed and ready to send: the offer, its files, the host's code.
+    offer: Option<(Offer, Vec<PathBuf>, String)>,
+    /// A newer sms, offered at the top.
+    release: Option<update::Release>,
 }
 
 struct App {
@@ -96,6 +105,15 @@ impl App {
             enabled: is_enabled(&s),
             ..Default::default()
         }));
+        if std::env::var_os("SMS_NO_UPDATE").is_none() {
+            let (sink, repaint) = (shared.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                if let Ok(Some(r)) = update::check(crate::GITHUB) {
+                    sink.lock().unwrap().release = Some(r);
+                    repaint.request_repaint();
+                }
+            });
+        }
         let (sink, repaint) = (shared.clone(), ctx.clone());
         skyrim_mod_sync::set_event_sink(move |line| {
             let mut sh = sink.lock().unwrap();
@@ -200,6 +218,40 @@ impl App {
         });
     }
 
+    /// First press: lists the reports; the second (the button then names them) sends them.
+    fn send(&self, ctx: &egui::Context) {
+        let ready = self.shared.lock().unwrap().offer.take();
+        match ready {
+            None => self.start(ctx, "Finding reports...", |s, shared| {
+                let (offer, paths, host) = report_offer(&[], s)?;
+                let mut sh = shared.lock().unwrap();
+                sh.log
+                    .extend(offer_text(&offer, &paths).lines().map(str::to_owned));
+                sh.offer = Some((offer, paths, host));
+                Ok(())
+            }),
+            Some((offer, paths, host)) => {
+                self.start(ctx, "Sending reports...", move |_, shared| {
+                    let done = send_offer(&host, None, &offer, &paths)?;
+                    let mut sh = shared.lock().unwrap();
+                    sh.log.extend(result_text(done).lines().map(str::to_owned));
+                    Ok(())
+                })
+            }
+        }
+    }
+
+    /// Installs the newer release and starts it in place of this window.
+    fn update_sms(&self, ctx: &egui::Context, release: update::Release) {
+        self.start(ctx, "Updating sms...", move |_, _| {
+            update::install(&release)?;
+            std::process::Command::new(std::env::current_exe()?)
+                .args(std::env::args_os().skip(1))
+                .spawn()?;
+            std::process::exit(0);
+        });
+    }
+
     fn disable(&self, ctx: &egui::Context) {
         self.start(ctx, "Disabling...", |s, shared| {
             let done = disable(s)?;
@@ -213,7 +265,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (busy, enable_label, log, error, status, enabled, progress) = {
+        let (busy, enable_label, log, error, status, enabled, progress, offer, release) = {
             let sh = self.shared.lock().unwrap();
             (
                 sh.busy,
@@ -223,10 +275,27 @@ impl eframe::App for App {
                 sh.status.clone(),
                 sh.enabled,
                 sh.progress.clone(),
+                sh.offer.as_ref().map(|o| (o.0.files.len(), o.0.bytes())),
+                sh.release.clone(),
             )
         };
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("SkyrimModSync");
+            if let Some(r) = release {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "sms {} is out (you have {}).",
+                        r.version,
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                    if ui
+                        .add_enabled(busy.is_none(), egui::Button::new("Update and restart"))
+                        .clicked()
+                    {
+                        self.update_sms(ctx, r.clone());
+                    }
+                });
+            }
             ui.add_space(6.0);
             fn wide(text: &mut String) -> egui::TextEdit<'_> {
                 egui::TextEdit::singleline(text).desired_width(f32::INFINITY)
@@ -285,6 +354,17 @@ impl eframe::App for App {
                     .clicked()
                 {
                     self.disable(ctx);
+                }
+                let send = match offer {
+                    Some((n, bytes)) => format!("Send these {n} files ({}) to the host", size(bytes)),
+                    None => "Send reports".into(),
+                };
+                if ui
+                    .add_enabled(idle, egui::Button::new(send))
+                    .on_hover_text("Your game's exported reports, to your host (they accept first).")
+                    .clicked()
+                {
+                    self.send(ctx);
                 }
                 if let Some(text) = busy {
                     ui.spinner();

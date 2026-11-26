@@ -260,6 +260,7 @@ impl Host {
             loadorder: masters.chain(plugins.iter().cloned()).collect(),
             plugins: plugins.iter().map(|p| format!("*{p}")).collect(),
             ini: list.ini.clone(),
+            reports: list.reports.clone(),
             archives: archives
                 .into_values()
                 .filter(|a| used.contains(a.hash.as_str()))
@@ -430,6 +431,7 @@ impl Host {
                 mods: vec![],
                 plugins: vec![],
                 ini: Default::default(),
+                reports: vec![],
             }
         };
         let list_dir = list_dir(list_path);

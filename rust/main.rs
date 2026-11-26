@@ -10,10 +10,11 @@ use skyrim_mod_sync::{
     launch,
     net::Net,
     pack::Pack,
-    peer::{self, Published},
+    peer::{self, Inbox, Published},
+    reports::{self, Offer},
     size, steam,
     store::Store,
-    sync, Error, Result,
+    sync, update, Error, Result,
 };
 use std::{
     io::{self, IsTerminal},
@@ -79,6 +80,21 @@ enum Command {
     },
     /// Take the pack out of the game: it is back as it was.
     Disable,
+    /// Send the host your reports (the files their list names, from the last week), or FILES. Lists
+    /// them and asks first; the host accepts or refuses.
+    Send {
+        files: Vec<PathBuf>,
+        /// Send without asking (the host still accepts or refuses).
+        #[arg(long, short)]
+        yes: bool,
+        #[arg(long, hide = true)]
+        peer_address: Option<SocketAddr>,
+    },
+    /// Update sms to the newest release (asks first).
+    Update {
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// What is set up, synced and enabled.
     Status,
     /// Delete synced files the current pack no longer uses.
@@ -516,6 +532,175 @@ fn default_list() -> Result<PathBuf> {
         })
 }
 
+pub(crate) const GITHUB: &str = "https://api.github.com";
+
+fn update_question(r: &update::Release) -> String {
+    format!(
+        "sms {} is out (you have {}). Update now?",
+        r.version,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// What `sms send` offers: the given files, or the host list's reports from the last week; and the
+/// host's code (from the synced pack).
+pub(crate) fn report_offer(
+    given: &[PathBuf],
+    s: &Settings,
+) -> Result<(Offer, Vec<PathBuf>, String)> {
+    let pack = store(s)?
+        .pack()?
+        .ok_or_else(|| Error::new("not_synced", "No pack yet: enable your host's pack first."))?;
+    let paths = if given.is_empty() {
+        if pack.reports.is_empty() {
+            return Err(Error::new(
+                "no_reports",
+                "Your host's list names no reports: `sms send FILE...` sends files you choose.",
+            ));
+        }
+        let found = reports::pick(
+            &pack.reports,
+            &config::require(&s.documents, "documents folder")?,
+            &game(s)?.root,
+        );
+        if found.is_empty() {
+            return Err(Error::new(
+                "no_reports",
+                format!(
+                    "No reports from the last week ({}).",
+                    pack.reports.join(", ")
+                ),
+            ));
+        }
+        found
+    } else {
+        given.to_vec()
+    };
+    Ok((reports::offer(&paths)?, paths, pack.host))
+}
+
+/// The offer for the person sending it: each file with its size and folder.
+pub(crate) fn offer_text(offer: &Offer, paths: &[PathBuf]) -> String {
+    let mut out = format!("To send as {}:", offer.from);
+    for (f, p) in offer.files.iter().zip(paths) {
+        let dir = p
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        out.push_str(&format!("\n  {}  {}  ({dir})", f.name, size(f.size)));
+    }
+    out
+}
+
+pub(crate) fn send_offer(
+    host: &str,
+    direct: Option<SocketAddr>,
+    offer: &Offer,
+    paths: &[PathBuf],
+) -> Result<Value> {
+    let accepted = peer::send_reports(host, direct, offer, paths, || {
+        skyrim_mod_sync::say(
+            "waiting",
+            "Waiting for the host to accept (their `sms host` asks them)...",
+            json!({}),
+        )
+    })?;
+    Ok(if accepted {
+        json!({"state": "sent", "files": offer.files.len(), "note": "The host has your reports."})
+    } else {
+        json!({"state": "refused", "note": "The host said no (or isn't at their `sms host` terminal)."})
+    })
+}
+
+/// Reports from friends go next to the list, in received/<friend>; each offer is asked at the terminal.
+fn inbox(list: &Path, interactive: bool) -> Result<Inbox> {
+    let dir = std::path::absolute(list)?
+        .parent()
+        .map(|d| d.join("received"))
+        .ok_or_else(|| Error::new("list_required", "No folder for the list."))?;
+    if !interactive || !io::stdin().is_terminal() {
+        return Ok(Inbox {
+            dir,
+            ask: Box::new(|offer| {
+                skyrim_mod_sync::say(
+                    "offer_refused",
+                    &format!(
+                        "{}\nRefused: run `sms host` in a terminal to accept reports.",
+                        offer.describe()
+                    ),
+                    json!({"from": offer.from, "files": offer.files.len()}),
+                );
+                false
+            }),
+        });
+    }
+    // One reader of stdin; one question at a time; Ctrl-C or 5 minutes without an answer is a no.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lines().map_while(std::result::Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let rx = std::sync::Mutex::new(rx);
+    let into = dir.clone();
+    Ok(Inbox {
+        dir,
+        ask: Box::new(move |offer| {
+            let rx = rx.lock().unwrap();
+            while rx.try_recv().is_ok() {}
+            eprint!(
+                "\n{}\nThey go to {}. Accept? [y/N] ",
+                offer.describe(),
+                into.join(&offer.from).display()
+            );
+            let _ = io::Write::flush(&mut io::stderr());
+            let start = std::time::Instant::now();
+            let yes = loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(line) => break line.trim().to_ascii_lowercase().starts_with('y'),
+                    Err(_)
+                        if skyrim_mod_sync::CANCELLED
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            || start.elapsed().as_secs() > 300 =>
+                    {
+                        break false
+                    }
+                    Err(_) => {}
+                }
+            };
+            eprintln!("{}", if yes { "Accepted." } else { "Refused." });
+            yes
+        }),
+    })
+}
+
+/// The newest release, once a day at a terminal: asks, updates, and runs the same command again.
+fn offer_update(command: &Option<Command>) -> Option<ExitCode> {
+    if matches!(command, Some(Command::Update { .. }))
+        || !io::stdin().is_terminal()
+        || !update::due()
+    {
+        return None;
+    }
+    let release = update::check(GITHUB).ok()??;
+    if !confirm(&update_question(&release)).unwrap_or(false) {
+        eprintln!("Later, then: `sms update` any time.");
+        return None;
+    }
+    if let Err(e) = update::install(&release) {
+        eprintln!("error: {}", e.message);
+        return None;
+    }
+    let status = std::process::Command::new(std::env::current_exe().ok()?)
+        .args(std::env::args_os().skip(1))
+        .env("SMS_NO_UPDATE", "1")
+        .status()
+        .ok()?;
+    Some(ExitCode::from(status.code().unwrap_or(2) as u8))
+}
+
 /// The list `sms host add` writes to: the default one, or a new modlist.json here.
 fn add_list() -> Result<PathBuf> {
     Ok(default_list().unwrap_or_else(|_| PathBuf::from("modlist.json")))
@@ -575,6 +760,7 @@ fn host(
     peer::serve(
         h.key()?,
         own,
+        Some(inbox(&list, interactive)?),
         bind,
         |peer_code| {
             if json_mode {
@@ -643,6 +829,37 @@ fn run(command: Option<Command>, json_mode: bool) -> Result<Value> {
             check(code, peer_address, &ready(interactive)?, json_mode)
         }
         Command::Disable => disable(&Settings::load()?),
+        Command::Send {
+            files,
+            yes,
+            peer_address,
+        } => {
+            let s = ready(interactive)?;
+            let (offer, paths, host) = report_offer(&files, &s)?;
+            if !json_mode {
+                eprintln!("{}", offer_text(&offer, &paths));
+            }
+            if !yes
+                && !json_mode
+                && !confirm(&format!(
+                    "Send these to the host ({})?",
+                    size(offer.bytes())
+                ))?
+            {
+                return Ok(json!({"state": "declined", "note": "Nothing sent."}));
+            }
+            send_offer(&host, peer_address, &offer, &paths)
+        }
+        Command::Update { yes } => match update::check(GITHUB)? {
+            None => Ok(json!({"state": "current", "version": env!("CARGO_PKG_VERSION")})),
+            Some(r) => {
+                if !yes && (json_mode || !confirm(&update_question(&r))?) {
+                    return Ok(json!({"state": "declined", "latest": r.version}));
+                }
+                update::install(&r)?;
+                Ok(json!({"state": "updated", "version": r.version}))
+            }
+        },
         Command::Status => status(),
         Command::Clean => {
             let freed = store(&Settings::load()?)?.clean()?;
@@ -758,6 +975,7 @@ fn double_clicked() -> bool {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_mode = cli.json;
+    update::tidy();
     if cli.command.is_none() && !json_mode && double_clicked() {
         return match gui::run() {
             Ok(_) => ExitCode::SUCCESS,
@@ -766,6 +984,11 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         };
+    }
+    if !json_mode {
+        if let Some(code) = offer_update(&cli.command) {
+            return code;
+        }
     }
     let hold = cfg!(windows) && cli.command.is_none() && !json_mode;
     skyrim_mod_sync::JSON.store(json_mode, std::sync::atomic::Ordering::Relaxed);

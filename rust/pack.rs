@@ -59,6 +59,9 @@ pub struct Pack {
     pub ini: Ini,
     pub archives: Vec<Archive>,
     pub files: Vec<Entry>,
+    /// Files friends can send the host (`sms send`): `Documents/…` or `Game/…`, `*` in the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
 }
 
 impl Pack {
@@ -69,6 +72,9 @@ impl Pack {
                 "This pack needs another sms version (schema {}).",
                 self.schema
             ));
+        }
+        for r in &self.reports {
+            crate::reports::valid_pattern(r)?;
         }
         for p in self.plugins.iter().chain(&self.loadorder) {
             rules::plugin_name(p.trim_start_matches('*'))?;
@@ -132,6 +138,7 @@ pub(crate) fn sample() -> Pack {
         host: String::new(),
         plugins: vec!["*A.esp".into()],
         loadorder: vec!["Skyrim.esm".into(), "A.esp".into()],
+        reports: vec![],
         ini: Ini::new(),
         archives: vec![Archive {
             hash: "a".repeat(64),

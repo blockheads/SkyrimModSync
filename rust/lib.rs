@@ -12,12 +12,14 @@ pub mod list;
 pub mod net;
 pub mod pack;
 pub mod peer;
+pub mod reports;
 pub mod rules;
 pub mod steam;
 pub mod store;
 pub mod sync;
 #[cfg(test)]
 mod tests;
+pub mod update;
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};

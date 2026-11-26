@@ -57,6 +57,9 @@ pub struct ModList {
     /// Shared INI settings: file -> section -> key -> value.
     #[serde(default, skip_serializing_if = "crate::pack::Ini::is_empty")]
     pub ini: crate::pack::Ini,
+    /// Files friends can send you (`sms send`): `Documents/…` or `Game/…`, `*` in the file name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
 }
 
 impl ModList {
@@ -64,6 +67,9 @@ impl ModList {
         let list: Self = files::read_json(path).map_err(|e| {
             Error::new("invalid_list", format!("{}: {}", path.display(), e.message))
         })?;
+        for r in &list.reports {
+            crate::reports::valid_pattern(r)?;
+        }
         for m in &list.mods {
             let sources = [
                 m.nexus.is_some(),
