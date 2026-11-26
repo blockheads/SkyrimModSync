@@ -30,7 +30,7 @@ Decisions (2026-11-25):
   (2026-11-26) over host-only conversion with an external tool. Members over 256 MB unpack to a temp file.
 - **Reports gated on both sides** (v0.10): friends see and confirm what they send; the host accepts each
   offer at its terminal. Anyone with the pack code may offer; only a yes writes anything.
-- **Self-update** (v0.10): the newest GitHub release, checked once a day; asked first; the binary is
+- **Self-update** (v0.10): the newest GitHub release, checked at every start (v0.10.1; once a day before); asked first; the binary is
   checked against the release's SHA256SUMS and swapped in place (Windows: the old one renamed aside).
 - **Simple and fast** (v0.5): one hash (BLAKE3, parallel), no signing layer (iroh authenticates the host), the host
   serves files from where they are.

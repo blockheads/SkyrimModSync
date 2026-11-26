@@ -676,11 +676,11 @@ fn inbox(list: &Path, interactive: bool) -> Result<Inbox> {
     })
 }
 
-/// The newest release, once a day at a terminal: asks, updates, and runs the same command again.
+/// The newest release, at every start at a terminal: asks, updates, and runs the same command again.
 fn offer_update(command: &Option<Command>) -> Option<ExitCode> {
     if matches!(command, Some(Command::Update { .. }))
         || !io::stdin().is_terminal()
-        || !update::due()
+        || !update::enabled()
     {
         return None;
     }

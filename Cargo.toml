@@ -1,6 +1,6 @@
 [package]
 name = "skyrim-mod-sync"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.91"
 description = "Share a Skyrim mod setup with friends: sync, load into the game, play, unload"

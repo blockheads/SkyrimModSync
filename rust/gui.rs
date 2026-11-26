@@ -105,7 +105,7 @@ impl App {
             enabled: is_enabled(&s),
             ..Default::default()
         }));
-        if std::env::var_os("SMS_NO_UPDATE").is_none() {
+        if update::enabled() {
             let (sink, repaint) = (shared.clone(), ctx.clone());
             std::thread::spawn(move || {
                 if let Ok(Some(r)) = update::check(crate::GITHUB) {

@@ -87,7 +87,7 @@ next to the list. Nothing arrives without your yes.
 
 ## Good to know
 
-- sms checks for a newer release once a day and asks before updating (`sms update` any time;
+- sms checks for a newer release every time it starts and asks before updating (`sms update` any time;
   `SMS_NO_UPDATE=1` turns the check off).
 - `sms check [code]` lists what is out of sync without downloading.
 - `sms status` shows what is set up and enabled; `sms clean` frees space from old versions.

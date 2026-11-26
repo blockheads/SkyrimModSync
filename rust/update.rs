@@ -1,16 +1,14 @@
-//! Updating sms itself: the newest GitHub release, checked at most once a day; with the person's
+//! Updating sms itself: the newest GitHub release, checked at every start; with the person's
 //! yes, its binary for this system (checked against SHA256SUMS) replaces the running one.
-use crate::{config, files, Error, Result};
+use crate::{Error, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 const REPO: &str = "blockheads/SkyrimModSync";
-const DAY: Duration = Duration::from_secs(24 * 3600);
-
 /// The release asset for this system.
 pub fn asset_name() -> &'static str {
     if cfg!(windows) {
@@ -52,7 +50,7 @@ pub fn check(api: &str) -> Result<Option<Release>> {
     let v: Value = client()?
         .get(format!("{api}/repos/{REPO}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(5))
         .send()?
         .error_for_status()?
         .json()?;
@@ -84,24 +82,9 @@ pub fn check(api: &str) -> Result<Option<Release>> {
     })
 }
 
-fn stamp() -> Result<PathBuf> {
-    Ok(config::directory()?.join("update-checked"))
-}
-
-/// Whether a day has passed since the last check (`SMS_NO_UPDATE` turns checks off); notes this one.
-pub fn due() -> bool {
-    if std::env::var_os("SMS_NO_UPDATE").is_some() {
-        return false;
-    }
-    let Ok(path) = stamp() else { return false };
-    let fresh = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < DAY);
-    if fresh {
-        return false;
-    }
-    let _ = files::write_atomic(&path, b"");
-    true
+/// Whether to look for a newer release at start (`SMS_NO_UPDATE` turns it off).
+pub fn enabled() -> bool {
+    std::env::var_os("SMS_NO_UPDATE").is_none()
 }
 
 /// `binary` when SHA256SUMS lists it under `name` with its hash.
