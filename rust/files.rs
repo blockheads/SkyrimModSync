@@ -132,3 +132,19 @@ pub fn root(path: &Path) -> Result<PathBuf> {
         )
     })
 }
+
+/// Whether two folders are on one drive (hardlinks work; else files are copied).
+pub fn same_drive(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev(),
+            _ => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        a.components().next() == b.components().next()
+    }
+}

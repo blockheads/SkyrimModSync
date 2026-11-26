@@ -200,11 +200,23 @@ fn setup(
             None => false,
         },
     };
-    let note = if nexus {
-        "Nexus mods download from Nexus."
+    let mut note = if nexus {
+        "Nexus mods download from Nexus.".to_owned()
     } else {
-        NO_KEY
+        NO_KEY.to_owned()
     };
+    let (g, st) = (
+        s.game.clone().unwrap_or_default(),
+        s.store.clone().unwrap_or_default(),
+    );
+    if !files::same_drive(&g, &st) {
+        let warning = format!(
+            "The mods folder {} is on another drive than Skyrim: mods will be copied (twice the space, slower). Pick one on Skyrim's drive with `sms setup --store <folder>`.",
+            st.display()
+        );
+        eprintln!("warning: {warning}");
+        note = format!("{note}\n{warning}");
+    }
     Ok(json!({"state": "ready", "settings": s, "nexus_premium": nexus, "note": note}))
 }
 

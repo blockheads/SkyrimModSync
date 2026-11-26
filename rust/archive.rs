@@ -71,8 +71,10 @@ fn walk(path: &Path, mut each: impl FnMut(&str, u64, &mut dyn Read) -> Result<()
                 if entry.is_directory() || failure.is_some() {
                     return Ok(true);
                 }
+                // Every entry read to its end: a solid block checks each entry's CRC, skipped ones too.
                 if let Err(e) = crate::check_cancel()
                     .and_then(|_| each(&normal(entry.name()), entry.size(), reader))
+                    .and_then(|_| Ok(std::io::copy(reader, &mut std::io::sink()).map(|_| ())?))
                 {
                     failure = Some(e);
                 }
@@ -161,6 +163,34 @@ mod tests {
             })
             .unwrap();
             assert_eq!(got, b"texture");
+        }
+    }
+    #[test]
+    fn one_member_comes_out_of_a_solid_7z() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                src.join(format!("f{i}.txt")),
+                format!("file {i}").repeat(1000),
+            )
+            .unwrap();
+        }
+        let seven = dir.path().join("a.7z");
+        let mut w = sevenz_rust2::ArchiveWriter::create(&seven).unwrap();
+        w.push_source_path(&src, |_| true).unwrap(); // solid, as mod archives are
+        w.finish().unwrap();
+        let m = members(&seven).unwrap();
+        assert_eq!(m.len(), 5);
+        for pick in [&m[0], &m[2], &m[4]] {
+            let mut got = vec![];
+            extract(&seven, &[pick.name.clone()].into(), |_, r| {
+                r.read_to_end(&mut got)?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(blake3::hash(&got).to_hex().to_string(), pick.hash);
         }
     }
     #[test]
