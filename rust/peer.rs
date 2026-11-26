@@ -216,27 +216,25 @@ impl Handler {
         }
         let offer: Offer = serde_json::from_slice(&body)?;
         let me = self.clone();
-        let decided = tokio::task::spawn_blocking(
-            move || -> Result<Option<Decided>> {
-                offer.validate()?;
-                let Some(inbox) = &me.0 .2 else {
-                    return Ok(None);
-                };
-                if !(inbox.ask)(&offer) {
-                    return Ok(None);
-                }
-                let (mut paths, mut offsets) = (vec![], vec![]);
-                for f in &offer.files {
-                    let (path, here) = reports::destination(&inbox.dir, &offer.from, f)?;
-                    let part = std::fs::metadata(path.with_extension("part"))
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    offsets.push(if here { f.size } else { part.min(f.size) });
-                    paths.push(path);
-                }
-                Ok(Some((offer, paths, offsets)))
-            },
-        )
+        let decided = tokio::task::spawn_blocking(move || -> Result<Option<Decided>> {
+            offer.validate()?;
+            let Some(inbox) = &me.0 .2 else {
+                return Ok(None);
+            };
+            if !(inbox.ask)(&offer) {
+                return Ok(None);
+            }
+            let (mut paths, mut offsets) = (vec![], vec![]);
+            for f in &offer.files {
+                let (path, here) = reports::destination(&inbox.dir, &offer.from, f)?;
+                let part = std::fs::metadata(path.with_extension("part"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                offsets.push(if here { f.size } else { part.min(f.size) });
+                paths.push(path);
+            }
+            Ok(Some((offer, paths, offsets)))
+        })
         .await
         .map_err(failure)??;
         match decided {
