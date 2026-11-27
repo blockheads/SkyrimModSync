@@ -739,6 +739,13 @@ fn host(
         Some(l) => l,
         None => default_list()?,
     };
+    // Checked before the game is touched: a wrong name must not take the pack out.
+    if !list.is_file() {
+        return Err(Error::new(
+            "list_missing",
+            format!("No mod list at {}.", list.display()),
+        ));
+    }
     let s = ready(interactive)?;
     let (g, st) = (game(&s)?, store(&s)?);
     launch::refuse_if_running(&g.root)?;
