@@ -48,7 +48,7 @@ struct App {
 pub fn run() -> Result<serde_json::Value> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SkyrimModSync")
+            .with_title(concat!("SkyrimModSync ", env!("CARGO_PKG_VERSION")))
             .with_inner_size([640.0, 560.0]),
         ..Default::default()
     };
@@ -280,7 +280,10 @@ impl eframe::App for App {
             )
         };
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SkyrimModSync");
+            ui.horizontal(|ui| {
+                ui.heading("SkyrimModSync");
+                ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
+            });
             if let Some(r) = release {
                 ui.horizontal(|ui| {
                     ui.label(format!(
