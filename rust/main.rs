@@ -543,14 +543,22 @@ fn update_question(r: &update::Release) -> String {
 }
 
 /// What `sms send` offers: the given files, or the host list's reports from the last week; and the
-/// host's code (from the synced pack).
+/// host's code (from the host's current pack, or the synced one offline).
 pub(crate) fn report_offer(
     given: &[PathBuf],
     s: &Settings,
 ) -> Result<(Offer, Vec<PathBuf>, String)> {
-    let pack = store(s)?
-        .pack()?
-        .ok_or_else(|| Error::new("not_synced", "No pack yet: enable your host's pack first."))?;
+    // The host's current pack (its reports may be newer than the one enabled here), else the enabled one.
+    let st = store(s)?;
+    let latest = std::fs::read_to_string(st.root.join("source.txt"))
+        .ok()
+        .and_then(|src| sync::fetch_pack(src.trim(), &net().ok()?, None).ok());
+    let pack = match latest {
+        Some(p) => p,
+        None => st.pack()?.ok_or_else(|| {
+            Error::new("not_synced", "No pack yet: enable your host's pack first.")
+        })?,
+    };
     let paths = if given.is_empty() {
         if pack.reports.is_empty() {
             return Err(Error::new(
