@@ -156,7 +156,7 @@ fn net() -> Result<Net> {
 /// An enabled or half-enabled pack comes out first (the game must not be running).
 fn disable(s: &Settings) -> Result<Value> {
     let g = game(s)?;
-    launch::refuse_if_running()?;
+    launch::refuse_if_running(&g.root)?;
     if g.state() == deploy::State::Clean {
         return Ok(json!({"state": "disabled", "note": "No pack is on: your game is as it was."}));
     }
@@ -168,7 +168,7 @@ fn disable(s: &Settings) -> Result<Value> {
 
 fn clean_game(g: &Game) -> Result<()> {
     if g.state() != deploy::State::Clean {
-        launch::refuse_if_running()?;
+        launch::refuse_if_running(&g.root)?;
         deploy::unload(g)?;
     }
     Ok(())
@@ -471,7 +471,7 @@ fn enable(
     ask: &dyn Fn(&sync::Check) -> Result<bool>,
 ) -> Result<Value> {
     let (g, st) = (game(s)?, store(s)?);
-    launch::refuse_if_running()?;
+    launch::refuse_if_running(&g.root)?;
     clean_game(&g)?;
     let net = net()?;
     let synced = match choose(code, direct, &st, &net)? {
@@ -741,7 +741,7 @@ fn host(
     };
     let s = ready(interactive)?;
     let (g, st) = (game(&s)?, store(&s)?);
-    launch::refuse_if_running()?;
+    launch::refuse_if_running(&g.root)?;
     clean_game(&g)?;
     let h = Host::open()?;
     let net = net()?;
