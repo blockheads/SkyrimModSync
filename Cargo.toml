@@ -1,6 +1,6 @@
 [package]
 name = "skyrim-mod-sync"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2021"
 rust-version = "1.91"
 description = "Share a Skyrim mod setup with friends: sync, load into the game, play, unload"
@@ -36,7 +36,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-ut
 zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Storage_FileSystem"] }
 winreg = "0.55"
 
 [profile.release]

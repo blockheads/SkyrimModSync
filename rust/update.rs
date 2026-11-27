@@ -127,18 +127,44 @@ pub fn replace(exe: &Path, binary: &[u8]) -> Result<()> {
     })?;
     #[cfg(unix)]
     std::fs::set_permissions(&fresh, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let step = |what: &str, e: std::io::Error| {
+        let _ = std::fs::remove_file(&fresh);
+        Error::new(
+            "update_failed",
+            format!("Can't {what} ({e}): update by hand from the releases page."),
+        )
+    };
     if cfg!(windows) {
         let old = old_path(exe);
         let _ = std::fs::remove_file(&old);
-        std::fs::rename(exe, &old)?;
-        if let Err(e) = std::fs::rename(&fresh, exe) {
-            let _ = std::fs::rename(&old, exe);
-            return Err(e.into());
+        move_file(exe, &old).map_err(|e| step("move the running sms aside", e))?;
+        if let Err(e) = move_file(&fresh, exe) {
+            let _ = move_file(&old, exe);
+            return Err(step("put the new sms in place", e));
         }
     } else {
-        std::fs::rename(&fresh, exe)?;
+        move_file(&fresh, exe).map_err(|e| step("put the new sms in place", e))?;
     }
     Ok(())
+}
+
+/// A rename that replaces `to`. On Windows, MoveFileExW: std's rename can fail with
+/// ERROR_NOT_SUPPORTED (os error 50) on some file systems.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        let (f, t) = (wide(from), wide(to));
+        // SAFETY: both are NUL-terminated wide strings that outlive the call.
+        if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), MOVEFILE_REPLACE_EXISTING) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(from, to)
 }
 
 fn old_path(exe: &Path) -> PathBuf {
